@@ -437,7 +437,14 @@ def write_pca(
     print(f"PCA outputs written: {pca_tsv}, {pca_png}")
 
 
-def write_heatmap(counts_df: pd.DataFrame, out_dir: Path, resume: bool, top_n: int = 50):
+def write_heatmap(
+    counts_df: pd.DataFrame,
+    out_dir: Path,
+    resume: bool,
+    top_n: int = 50,
+    meta_df: Optional[pd.DataFrame] = None,
+    condition_col: Optional[str] = None,
+):
     import matplotlib.pyplot as plt
     import numpy as np
 
@@ -449,6 +456,17 @@ def write_heatmap(counts_df: pd.DataFrame, out_dir: Path, resume: bool, top_n: i
         return
 
     x = np.log2(counts_df + 1.0)
+    if meta_df is not None and condition_col and condition_col in meta_df.columns:
+        common = x.index.intersection(meta_df.index)
+        if len(common) >= 2:
+            order = (
+                meta_df.loc[common, condition_col]
+                .astype(str)
+                .sort_values()
+                .index
+            )
+            x = x.loc[order]
+
     top_genes = x.var(axis=0).sort_values(ascending=False).head(max(top_n, 2)).index
     z = x[top_genes]
     z = (z - z.mean(axis=0)) / z.std(axis=0).replace(0, 1)
@@ -459,7 +477,11 @@ def write_heatmap(counts_df: pd.DataFrame, out_dir: Path, resume: bool, top_n: i
     ax.set_xlabel("Samples")
     ax.set_ylabel("Genes")
     ax.set_xticks(range(len(z.index)))
-    ax.set_xticklabels(z.index, rotation=90, fontsize=7)
+    if meta_df is not None and condition_col and condition_col in meta_df.columns:
+        sample_labels = [f"{s} ({meta_df.loc[s, condition_col]})" for s in z.index]
+        ax.set_xticklabels(sample_labels, rotation=90, fontsize=7)
+    else:
+        ax.set_xticklabels(z.index, rotation=90, fontsize=7)
     fig.colorbar(im, ax=ax, label="z-score")
     fig.tight_layout()
     fig.savefig(heatmap_png, dpi=180)
@@ -612,7 +634,7 @@ def run_deseq(
         return
 
     write_pca(counts_df, meta_df, condition_col, out_dir, resume)
-    write_heatmap(counts_df, out_dir, resume)
+    write_heatmap(counts_df, out_dir, resume, meta_df=meta_df, condition_col=condition_col)
     try:
         write_volcano(res, out_dir, resume)
     except Exception as exc:
