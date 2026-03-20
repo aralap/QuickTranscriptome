@@ -524,12 +524,21 @@ def run_deseq(
         print(f"Skipping DE/volcano because metadata matching failed: {exc}")
         return
 
+    # Ensure exact index compatibility for AnnData/PyDESeq2 internals.
+    counts_df = counts_df.copy()
+    meta_df = meta_df.copy()
+    counts_df.index = pd.Index(counts_df.index.astype(str), name="sample")
+    meta_df.index = pd.Index(meta_df.index.astype(str), name="sample")
+    counts_df.columns = counts_df.columns.astype(str)
+    counts_df = counts_df.loc[meta_df.index]
+    meta_df = meta_df.loc[counts_df.index]
+
     out = out_dir / "deseq2_results.tsv"
     try:
         if should_skip(out, resume, "DESeq2 results"):
             res = pd.read_csv(out, sep="\t")
         else:
-            dds = DeseqDataSet(counts=counts_df, metadata=meta_df, design_factors=condition_col)
+            dds = DeseqDataSet(counts=counts_df, metadata=meta_df, design=f"~{condition_col}")
             dds.deseq2()
             stats = DeseqStats(dds, n_cpus=1)
             stats.summary()
