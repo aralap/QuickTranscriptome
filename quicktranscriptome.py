@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 import argparse
 import gzip
-import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.request import urlretrieve
 
 import pandas as pd
@@ -13,8 +13,16 @@ import pandas as pd
 
 SPECIES_DEFAULTS = {
     "parapsilosis": {
-        "fasta_url": "https://ftp.ensemblgenomes.ebi.ac.uk/pub/fungi/release-60/fasta/candida_parapsilosis/dna/Candida_parapsilosis.C_parapsilosis_CDC317.dna.toplevel.fa.gz",
-        "gff_url": "https://ftp.ensemblgenomes.ebi.ac.uk/pub/fungi/release-60/gff3/candida_parapsilosis/Candida_parapsilosis.C_parapsilosis_CDC317.60.gff3.gz",
+        "fasta_urls": [
+            "https://ftp.ensemblgenomes.ebi.ac.uk/pub/fungi/release-60/fasta/candida_parapsilosis/dna/Candida_parapsilosis.GCA000182765v2.dna.toplevel.fa.gz",
+            "https://ftp.ensemblgenomes.ebi.ac.uk/pub/fungi/release-60/fasta/candida_parapsilosis/dna/Candida_parapsilosis.C_parapsilosis_CDC317.dna.toplevel.fa.gz",
+            "http://www.candidagenome.org/download/sequence/C_parapsilosis_CDC317/C_parapsilosis_CDC317_current_chromosomes.fasta",
+        ],
+        "gff_urls": [
+            "https://ftp.ensemblgenomes.ebi.ac.uk/pub/fungi/release-60/gff3/candida_parapsilosis/Candida_parapsilosis.GCA000182765v2.60.gff3.gz",
+            "https://ftp.ensemblgenomes.ebi.ac.uk/pub/fungi/release-60/gff3/candida_parapsilosis/Candida_parapsilosis.C_parapsilosis_CDC317.60.gff3.gz",
+            "http://www.candidagenome.org/download/gff/C_parapsilosis_CDC317/C_parapsilosis_CDC317_current_features.gff",
+        ],
     }
 }
 
@@ -34,6 +42,31 @@ def download_file(url: str, out_path: Path):
         return
     print(f"Downloading {url} -> {out_path}")
     urlretrieve(url, out_path)
+
+
+def normalize_urls(url_or_urls):
+    if url_or_urls is None:
+        return []
+    if isinstance(url_or_urls, str):
+        return [url_or_urls]
+    return list(url_or_urls)
+
+
+def download_first_available(urls, refs_dir: Path):
+    errors = []
+    for url in normalize_urls(urls):
+        out_path = refs_dir / Path(url).name
+        if out_path.exists():
+            print(f"Using cached file: {out_path}")
+            return out_path
+        try:
+            download_file(url, out_path)
+            return out_path
+        except (HTTPError, URLError) as exc:
+            errors.append(f"{url} -> {exc}")
+            print(f"Warning: could not download from {url} ({exc})")
+    joined = "\n".join(errors) if errors else "No URLs provided."
+    raise RuntimeError(f"Failed to download required reference file.\n{joined}")
 
 
 def gunzip_if_needed(path: Path) -> Path:
@@ -80,17 +113,19 @@ def discover_samples(reads_dir: Path):
 
 def build_reference(species, refs_dir: Path, fasta_url=None, gff_url=None):
     ensure_dir(refs_dir)
+    fasta_urls = normalize_urls(fasta_url)
+    gff_urls = normalize_urls(gff_url)
     if species in SPECIES_DEFAULTS:
         default = SPECIES_DEFAULTS[species]
-        fasta_url = fasta_url or default["fasta_url"]
-        gff_url = gff_url or default["gff_url"]
-    if not fasta_url or not gff_url:
+        if not fasta_urls:
+            fasta_urls = default["fasta_urls"]
+        if not gff_urls:
+            gff_urls = default["gff_urls"]
+    if not fasta_urls or not gff_urls:
         raise ValueError("You must provide --fasta-url and --gff-url for unknown species.")
 
-    fasta_gz = refs_dir / Path(fasta_url).name
-    gff_gz = refs_dir / Path(gff_url).name
-    download_file(fasta_url, fasta_gz)
-    download_file(gff_url, gff_gz)
+    fasta_gz = download_first_available(fasta_urls, refs_dir)
+    gff_gz = download_first_available(gff_urls, refs_dir)
 
     fasta = gunzip_if_needed(fasta_gz)
     gff = gunzip_if_needed(gff_gz)
