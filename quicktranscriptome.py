@@ -317,17 +317,31 @@ def align_and_count(args):
 def _sample_ordered_counts_and_metadata(counts_matrix: Path, metadata_path: Path, condition_col: str):
     counts_df = pd.read_csv(counts_matrix, sep="\t")
     meta_df = pd.read_csv(metadata_path, sep=None, engine="python")
+    meta_df.columns = [str(c).replace("\ufeff", "").strip() for c in meta_df.columns]
+    meta_df = meta_df.loc[:, [c for c in meta_df.columns if not c.lower().startswith("unnamed:")]]
+
+    if "sample" not in meta_df.columns:
+        sample_candidates = [c for c in meta_df.columns if c.lower().strip() == "sample"]
+        if sample_candidates:
+            meta_df = meta_df.rename(columns={sample_candidates[0]: "sample"})
     if "sample" not in meta_df.columns:
         raise ValueError("Metadata must include a 'sample' column.")
-    if condition_col not in meta_df.columns:
-        raise ValueError(f"Metadata missing condition column: {condition_col}")
+
+    condition_col_clean = str(condition_col).strip()
+    if condition_col_clean not in meta_df.columns:
+        alt = [c for c in meta_df.columns if c.lower().strip() == condition_col_clean.lower()]
+        if alt:
+            condition_col_clean = alt[0]
+        else:
+            raise ValueError(f"Metadata missing condition column: {condition_col}")
 
     counts_df = counts_df.set_index("gene_id").T
     counts_df.index = pd.Index([canonical_sample_id(s) for s in counts_df.index], name="sample")
     counts_df = counts_df.astype(int)
 
     meta_df = meta_df.copy()
-    meta_df["sample"] = meta_df["sample"].astype(str)
+    meta_df["sample"] = meta_df["sample"].astype(str).str.strip()
+    meta_df[condition_col_clean] = meta_df[condition_col_clean].astype("string").str.strip()
     meta_df["_sample_canonical"] = meta_df["sample"].map(canonical_sample_id)
 
     # Keep first metadata row per canonical sample to avoid ambiguous joins.
@@ -342,12 +356,22 @@ def _sample_ordered_counts_and_metadata(counts_matrix: Path, metadata_path: Path
         )
     counts_df = counts_df.loc[common]
     meta_df = meta_df.loc[common]
+    if meta_df[condition_col_clean].isna().all() or (meta_df[condition_col_clean] == "").all():
+        fallback_cols = [c for c in ["treatment", "condition", "group"] if c in meta_df.columns and c != condition_col_clean]
+        for fb in fallback_cols:
+            if not (meta_df[fb].isna().all() or (meta_df[fb].astype("string").str.strip() == "").all()):
+                print(
+                    f"Warning: metadata column '{condition_col_clean}' is empty for matched samples; "
+                    f"using '{fb}' instead."
+                )
+                condition_col_clean = fb
+                break
     meta_df.index.name = "sample"
-    return counts_df, meta_df
+    return counts_df, meta_df, condition_col_clean
 
 
 def print_sample_category_mapping(counts_df: pd.DataFrame, meta_df: pd.DataFrame, condition_col: str):
-    print("Sample/category mapping used for DE:")
+    print(f"Sample/category mapping used for DE (column='{condition_col}'):")
     if counts_df.empty:
         print("  (no samples available)")
         return
@@ -534,7 +558,9 @@ def run_deseq(
     from pydeseq2.ds import DeseqStats
 
     try:
-        counts_df, meta_df = _sample_ordered_counts_and_metadata(counts_matrix, metadata_path, condition_col)
+        counts_df, meta_df, condition_col = _sample_ordered_counts_and_metadata(
+            counts_matrix, metadata_path, condition_col
+        )
     except Exception as exc:
         print(f"Skipping DE/volcano because metadata matching failed: {exc}")
         return
@@ -556,7 +582,17 @@ def run_deseq(
         else:
             dds = DeseqDataSet(counts=counts_df, metadata=meta_df, design=f"~{condition_col}")
             dds.deseq2()
-            stats = DeseqStats(dds, n_cpus=1)
+            levels = [str(v) for v in pd.Series(meta_df[condition_col]).dropna().astype(str).unique().tolist()]
+            if len(levels) < 2:
+                raise ValueError(
+                    f"Need at least 2 groups in metadata column '{condition_col}' for DESeq2; got {levels}."
+                )
+            contrast = [condition_col, levels[1], levels[0]]
+            print(
+                "DESeq2 contrast selected: "
+                f"{condition_col}: {levels[1]} vs {levels[0]}"
+            )
+            stats = DeseqStats(dds, contrast=contrast, n_cpus=1)
             stats.summary()
             res = stats.results_df.reset_index().rename(columns={"index": "gene_id"})
             res.to_csv(out, sep="\t", index=False)
