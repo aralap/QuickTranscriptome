@@ -5,7 +5,8 @@ Minimal RNA-seq workflow with:
 - Reference/annotation download from the web
 - Alignment with `minimap2`
 - Read summarization with `featureCounts`
-- Optional downstream differential expression using treatment metadata (`pydeseq2`)
+- Resume-aware reruns (skip existing outputs)
+- Optional downstream differential expression + PCA + volcano (+ optional GSEA)
 
 ## 1) Install
 
@@ -36,6 +37,13 @@ This will:
 4. Run `featureCounts`
 5. Write count matrix to `results/counts/counts_matrix.tsv`
 
+By default, reruns will **resume** and reuse existing outputs:
+- existing BAMs are reused (and indexed if `.bai` is missing)
+- existing `featureCounts.txt` and `counts_matrix.tsv` are reused
+- existing DE/PCA/volcano/GSEA outputs are reused
+
+To force full recomputation, pass `--no-resume`.
+
 ## 4) Optional: provide treatment metadata for DE analysis
 
 Create `metadata.tsv`:
@@ -60,6 +68,25 @@ python quicktranscriptome.py run \
 
 DE results are written to:
 - `results/counts/deseq2_results.tsv`
+- `results/counts/pca_coordinates.tsv`
+- `results/counts/pca_plot.png`
+- `results/counts/volcano_plot.png`
+
+### Optional GSEA
+
+Provide a GMT gene-set file:
+
+```bash
+python quicktranscriptome.py run \
+  --reads-dir /path/to/fastqs \
+  --out-dir results \
+  --metadata metadata.tsv \
+  --condition-column treatment \
+  --gsea-gmt /path/to/genesets.gmt
+```
+
+GSEA outputs are written under:
+- `results/counts/gsea/`
 
 ## 5) Custom species/reference
 
@@ -72,3 +99,5 @@ python quicktranscriptome.py run \
   --fasta-url "https://example.org/reference.fa.gz" \
   --gff-url "https://example.org/annotation.gff3.gz"
 ```
+
+You can also pass your `Candida parapsilosis` Ensembl GTF/GFF URL directly if needed.

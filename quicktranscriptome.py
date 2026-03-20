@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import gzip
+import math
 import shutil
 import subprocess
 import sys
@@ -34,6 +35,13 @@ def run_cmd(cmd):
 
 def ensure_dir(path: Path):
     path.mkdir(parents=True, exist_ok=True)
+
+
+def should_skip(path: Path, resume: bool, label: str) -> bool:
+    if resume and path.exists():
+        print(f"Resume enabled: using existing {label}: {path}")
+        return True
+    return False
 
 
 def download_file(url: str, out_path: Path):
@@ -156,8 +164,10 @@ def align_and_count(args):
     for sample, r1, r2 in samples:
         bam = bam_dir / f"{sample}.sorted.bam"
         bam_files.append(bam)
-        if bam.exists():
-            print(f"Using existing BAM: {bam}")
+        bai = bam.with_suffix(bam.suffix + ".bai")
+        if should_skip(bam, args.resume, "BAM"):
+            if not bai.exists():
+                run_cmd(["samtools", "index", str(bam)])
             continue
 
         if r2 is None:
@@ -202,18 +212,19 @@ def align_and_count(args):
         run_cmd(["samtools", "index", str(bam)])
 
     count_file = counts_dir / "featureCounts.txt"
-    run_cmd(
-        [
-            "featureCounts",
-            "-T",
-            str(args.threads),
-            "-a",
-            str(gff),
-            "-o",
-            str(count_file),
-            *[str(b) for b in bam_files],
-        ]
-    )
+    if not should_skip(count_file, args.resume, "featureCounts output"):
+        run_cmd(
+            [
+                "featureCounts",
+                "-T",
+                str(args.threads),
+                "-a",
+                str(gff),
+                "-o",
+                str(count_file),
+                *[str(b) for b in bam_files],
+            ]
+        )
 
     # Convert featureCounts output to compact matrix.
     df = pd.read_csv(count_file, sep="\t", comment="#")
@@ -222,17 +233,24 @@ def align_and_count(args):
     clean = df[["Geneid", *sample_cols]].copy()
     clean.columns = ["gene_id", *[Path(c).stem.replace(".sorted", "") for c in sample_cols]]
     clean_out = counts_dir / "counts_matrix.tsv"
-    clean.to_csv(clean_out, sep="\t", index=False)
-    print(f"Counts matrix written: {clean_out}")
+    if not should_skip(clean_out, args.resume, "counts matrix"):
+        clean.to_csv(clean_out, sep="\t", index=False)
+        print(f"Counts matrix written: {clean_out}")
 
     if args.metadata and args.condition_column:
-        run_deseq(clean_out, Path(args.metadata), args.condition_column, counts_dir)
+        run_deseq(
+            clean_out,
+            Path(args.metadata),
+            args.condition_column,
+            counts_dir,
+            args.resume,
+            args.gsea_gmt,
+            args.gsea_min_size,
+            args.gsea_max_size,
+        )
 
 
-def run_deseq(counts_matrix: Path, metadata_path: Path, condition_col: str, out_dir: Path):
-    from pydeseq2.dds import DeseqDataSet
-    from pydeseq2.ds import DeseqStats
-
+def _sample_ordered_counts_and_metadata(counts_matrix: Path, metadata_path: Path, condition_col: str):
     counts_df = pd.read_csv(counts_matrix, sep="\t")
     meta_df = pd.read_csv(metadata_path, sep=None, engine="python")
     if "sample" not in meta_df.columns:
@@ -249,15 +267,158 @@ def run_deseq(counts_matrix: Path, metadata_path: Path, condition_col: str, out_
         raise ValueError("No overlapping samples between counts and metadata.")
     counts_df = counts_df.loc[common]
     meta_df = meta_df.set_index("sample").loc[common]
+    return counts_df, meta_df
 
-    dds = DeseqDataSet(counts=counts_df, metadata=meta_df, design_factors=condition_col)
-    dds.deseq2()
-    stats = DeseqStats(dds, n_cpus=1)
-    stats.summary()
-    res = stats.results_df.reset_index().rename(columns={"index": "gene_id"})
+
+def write_pca(counts_df: pd.DataFrame, meta_df: pd.DataFrame, condition_col: str, out_dir: Path, resume: bool):
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    pca_tsv = out_dir / "pca_coordinates.tsv"
+    pca_png = out_dir / "pca_plot.png"
+    if should_skip(pca_tsv, resume, "PCA coordinates") and should_skip(pca_png, resume, "PCA plot"):
+        return
+
+    vst_like = np.log2(counts_df + 1.0)
+    x = vst_like.to_numpy(dtype=float)
+    x = x - x.mean(axis=0, keepdims=True)
+    u, s, vt = np.linalg.svd(x, full_matrices=False)
+    pc_scores = u[:, :2] * s[:2]
+    var_exp = (s ** 2) / max((x.shape[0] - 1), 1)
+    var_exp_ratio = var_exp / max(var_exp.sum(), 1e-12)
+    pca_df = pd.DataFrame(
+        {
+            "sample": counts_df.index,
+            "PC1": pc_scores[:, 0] if pc_scores.shape[1] > 0 else 0.0,
+            "PC2": pc_scores[:, 1] if pc_scores.shape[1] > 1 else 0.0,
+            condition_col: meta_df[condition_col].values,
+        }
+    )
+    pca_df.to_csv(pca_tsv, sep="\t", index=False)
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    for cond, group in pca_df.groupby(condition_col):
+        ax.scatter(group["PC1"], group["PC2"], label=str(cond), s=70, alpha=0.85)
+        for _, row in group.iterrows():
+            ax.annotate(row["sample"], (row["PC1"], row["PC2"]), fontsize=8, alpha=0.85)
+    ax.set_xlabel(f"PC1 ({var_exp_ratio[0] * 100:.1f}% var)" if len(var_exp_ratio) > 0 else "PC1")
+    ax.set_ylabel(f"PC2 ({var_exp_ratio[1] * 100:.1f}% var)" if len(var_exp_ratio) > 1 else "PC2")
+    ax.set_title("PCA of samples (log2 counts + 1)")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(pca_png, dpi=180)
+    plt.close(fig)
+    print(f"PCA outputs written: {pca_tsv}, {pca_png}")
+
+
+def write_volcano(deseq_df: pd.DataFrame, out_dir: Path, resume: bool):
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    volcano_png = out_dir / "volcano_plot.png"
+    if should_skip(volcano_png, resume, "volcano plot"):
+        return
+
+    plot_df = deseq_df.copy()
+    if "padj" not in plot_df.columns or "log2FoldChange" not in plot_df.columns:
+        print("Skipping volcano plot: DESeq2 columns 'padj'/'log2FoldChange' not found.")
+        return
+    plot_df["padj"] = pd.to_numeric(plot_df["padj"], errors="coerce")
+    plot_df["log2FoldChange"] = pd.to_numeric(plot_df["log2FoldChange"], errors="coerce")
+    plot_df = plot_df.dropna(subset=["padj", "log2FoldChange"])
+    if plot_df.empty:
+        print("Skipping volcano plot: no valid DE rows.")
+        return
+    plot_df["neg_log10_padj"] = -np.log10(plot_df["padj"].clip(lower=1e-300))
+    sig = (plot_df["padj"] < 0.05) & (plot_df["log2FoldChange"].abs() >= 1.0)
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.scatter(plot_df.loc[~sig, "log2FoldChange"], plot_df.loc[~sig, "neg_log10_padj"], s=10, alpha=0.4, color="grey")
+    ax.scatter(plot_df.loc[sig, "log2FoldChange"], plot_df.loc[sig, "neg_log10_padj"], s=14, alpha=0.7, color="crimson")
+    ax.axhline(-math.log10(0.05), linestyle="--", color="black", linewidth=1)
+    ax.axvline(-1.0, linestyle="--", color="black", linewidth=1)
+    ax.axvline(1.0, linestyle="--", color="black", linewidth=1)
+    ax.set_xlabel("log2 fold change")
+    ax.set_ylabel("-log10 adjusted p-value")
+    ax.set_title("Volcano plot")
+    fig.tight_layout()
+    fig.savefig(volcano_png, dpi=180)
+    plt.close(fig)
+    print(f"Volcano plot written: {volcano_png}")
+
+
+def run_gsea(
+    deseq_df: pd.DataFrame,
+    gsea_gmt: str,
+    out_dir: Path,
+    resume: bool,
+    gsea_min_size: int,
+    gsea_max_size: int,
+):
+    gsea_dir = out_dir / "gsea"
+    ensure_dir(gsea_dir)
+    marker = gsea_dir / "gseapy.gene_set.prerank.report.csv"
+    if should_skip(marker, resume, "GSEA report"):
+        return
+    try:
+        import gseapy as gp
+    except ImportError:
+        print("Skipping GSEA: gseapy is not installed. Add it to environment to enable GSEA.")
+        return
+
+    rank_col = "stat" if "stat" in deseq_df.columns else "log2FoldChange"
+    if rank_col not in deseq_df.columns:
+        print("Skipping GSEA: no suitable ranking column ('stat' or 'log2FoldChange').")
+        return
+    ranking = deseq_df[["gene_id", rank_col]].copy()
+    ranking[rank_col] = pd.to_numeric(ranking[rank_col], errors="coerce")
+    ranking = ranking.dropna().sort_values(rank_col, ascending=False)
+    if ranking.empty:
+        print("Skipping GSEA: ranking table is empty.")
+        return
+    gp.prerank(
+        rnk=ranking,
+        gene_sets=gsea_gmt,
+        outdir=str(gsea_dir),
+        min_size=gsea_min_size,
+        max_size=gsea_max_size,
+        seed=42,
+        verbose=True,
+    )
+    print(f"GSEA outputs written: {gsea_dir}")
+
+
+def run_deseq(
+    counts_matrix: Path,
+    metadata_path: Path,
+    condition_col: str,
+    out_dir: Path,
+    resume: bool,
+    gsea_gmt: str,
+    gsea_min_size: int,
+    gsea_max_size: int,
+):
+    from pydeseq2.dds import DeseqDataSet
+    from pydeseq2.ds import DeseqStats
+
+    counts_df, meta_df = _sample_ordered_counts_and_metadata(counts_matrix, metadata_path, condition_col)
+
     out = out_dir / "deseq2_results.tsv"
-    res.to_csv(out, sep="\t", index=False)
-    print(f"Differential expression results written: {out}")
+    if should_skip(out, resume, "DESeq2 results"):
+        res = pd.read_csv(out, sep="\t")
+    else:
+        dds = DeseqDataSet(counts=counts_df, metadata=meta_df, design_factors=condition_col)
+        dds.deseq2()
+        stats = DeseqStats(dds, n_cpus=1)
+        stats.summary()
+        res = stats.results_df.reset_index().rename(columns={"index": "gene_id"})
+        res.to_csv(out, sep="\t", index=False)
+        print(f"Differential expression results written: {out}")
+
+    write_pca(counts_df, meta_df, condition_col, out_dir, resume)
+    write_volcano(res, out_dir, resume)
+    if gsea_gmt:
+        run_gsea(res, gsea_gmt, out_dir, resume, gsea_min_size, gsea_max_size)
 
 
 def build_parser():
@@ -281,6 +442,19 @@ def build_parser():
         default=None,
         help="Condition/treatment column for DE (requires --metadata)",
     )
+    run_p.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Resume from existing outputs if present (default: True). Use --no-resume to force rerun.",
+    )
+    run_p.add_argument(
+        "--gsea-gmt",
+        default=None,
+        help="Optional path to GMT gene-set file for preranked GSEA.",
+    )
+    run_p.add_argument("--gsea-min-size", type=int, default=10, help="Minimum gene-set size for GSEA.")
+    run_p.add_argument("--gsea-max-size", type=int, default=500, help="Maximum gene-set size for GSEA.")
     run_p.set_defaults(func=align_and_count)
     return parser
 

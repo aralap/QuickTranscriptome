@@ -8,7 +8,10 @@ dependencies:
   - samtools
   - subread
   - pandas
+  - numpy
+  - matplotlib
   - pyyaml
   - requests
   - scipy
   - pydeseq2
+  - gseapy
