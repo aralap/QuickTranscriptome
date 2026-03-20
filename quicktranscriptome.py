@@ -573,6 +573,16 @@ def run_deseq(
     counts_df.columns = counts_df.columns.astype(str)
     counts_df = counts_df.loc[meta_df.index]
     meta_df = meta_df.loc[counts_df.index]
+    counts_df = counts_df.apply(pd.to_numeric, errors="coerce").fillna(0).astype(int)
+    meta_df[condition_col] = meta_df[condition_col].astype(str).str.strip()
+    meta_df.loc[meta_df[condition_col].isin(["", "nan", "None", "<NA>"]), condition_col] = pd.NA
+    valid = meta_df[condition_col].notna()
+    counts_df = counts_df.loc[valid]
+    meta_df = meta_df.loc[valid]
+    if counts_df.empty or len(meta_df) < 2:
+        raise ValueError(
+            f"Not enough valid samples after cleaning metadata column '{condition_col}' for DESeq2."
+        )
     print_sample_category_mapping(counts_df, meta_df, condition_col)
 
     out = out_dir / "deseq2_results.tsv"
