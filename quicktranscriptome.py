@@ -114,7 +114,22 @@ def featurecounts_annotation_args(annotation_path: Path):
     fmt = detect_annotation_format(annotation_path)
     if fmt == "GFF":
         # For many GFF3s, exon Parent points to transcript IDs; counting on gene features is safer.
-        return ["-F", "GFF", "-t", "gene", "-g", "ID"]
+        # Prefer gene_id when present (clean IDs), fallback to ID.
+        gene_attr = "ID"
+        with open(annotation_path, "r", encoding="utf-8", errors="ignore") as handle:
+            for line in handle:
+                if not line.strip() or line.startswith("#"):
+                    continue
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 9:
+                    continue
+                if parts[2] != "gene":
+                    continue
+                attrs = parts[8]
+                if "gene_id=" in attrs:
+                    gene_attr = "gene_id"
+                break
+        return ["-F", "GFF", "-t", "gene", "-g", gene_attr]
     return ["-F", "GTF", "-t", "exon", "-g", "gene_id"]
 
 
@@ -276,15 +291,13 @@ def align_and_count(args):
     sample_cols = [c for c in df.columns if c not in fixed_cols]
     clean = df[["Geneid", *sample_cols]].copy()
     clean.columns = ["gene_id", *[Path(c).stem.replace(".sorted", "") for c in sample_cols]]
+    clean["gene_id"] = clean["gene_id"].astype(str).str.replace("^gene:", "", regex=True)
     clean_out = counts_dir / "counts_matrix.tsv"
     if not should_skip(clean_out, args.resume, "counts matrix"):
         clean.to_csv(clean_out, sep="\t", index=False)
         print(f"Counts matrix written: {clean_out}")
 
     counts_for_plots = clean.set_index("gene_id").T.astype(int)
-    write_pca(counts_for_plots, None, None, counts_dir, args.resume)
-    write_heatmap(counts_for_plots, counts_dir, args.resume)
-
     if args.metadata and args.condition_column:
         run_deseq(
             clean_out,
@@ -296,6 +309,9 @@ def align_and_count(args):
             args.gsea_min_size,
             args.gsea_max_size,
         )
+    else:
+        write_pca(counts_for_plots, None, None, counts_dir, args.resume)
+        write_heatmap(counts_for_plots, counts_dir, args.resume)
 
 
 def _sample_ordered_counts_and_metadata(counts_matrix: Path, metadata_path: Path, condition_col: str):
