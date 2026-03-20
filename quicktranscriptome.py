@@ -346,6 +346,21 @@ def _sample_ordered_counts_and_metadata(counts_matrix: Path, metadata_path: Path
     return counts_df, meta_df
 
 
+def print_sample_category_mapping(counts_df: pd.DataFrame, meta_df: pd.DataFrame, condition_col: str):
+    print("Sample/category mapping used for DE:")
+    if counts_df.empty:
+        print("  (no samples available)")
+        return
+    if condition_col not in meta_df.columns:
+        print(f"  (metadata column '{condition_col}' not found)")
+        for sample in counts_df.index:
+            print(f"  - sample={sample} category=NA")
+        return
+    for sample in counts_df.index:
+        category = meta_df.loc[sample, condition_col] if sample in meta_df.index else "NA"
+        print(f"  - sample={sample} category={category}")
+
+
 def write_pca(
     counts_df: pd.DataFrame,
     meta_df: Optional[pd.DataFrame],
@@ -532,6 +547,7 @@ def run_deseq(
     counts_df.columns = counts_df.columns.astype(str)
     counts_df = counts_df.loc[meta_df.index]
     meta_df = meta_df.loc[counts_df.index]
+    print_sample_category_mapping(counts_df, meta_df, condition_col)
 
     out = out_dir / "deseq2_results.tsv"
     try:
