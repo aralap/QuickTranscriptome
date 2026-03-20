@@ -88,6 +88,35 @@ def gunzip_if_needed(path: Path) -> Path:
     return out
 
 
+def detect_annotation_format(annotation_path: Path) -> str:
+    lower = annotation_path.name.lower()
+    if lower.endswith(".gff") or lower.endswith(".gff3"):
+        return "GFF"
+    if lower.endswith(".gtf"):
+        return "GTF"
+
+    with open(annotation_path, "r", encoding="utf-8", errors="ignore") as handle:
+        for line in handle:
+            if not line.strip() or line.startswith("#"):
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 9:
+                continue
+            attrs = parts[8]
+            if "=" in attrs and "gene_id" not in attrs:
+                return "GFF"
+            return "GTF"
+    return "GTF"
+
+
+def featurecounts_annotation_args(annotation_path: Path):
+    fmt = detect_annotation_format(annotation_path)
+    if fmt == "GFF":
+        # For many GFF3s, exon Parent points to transcript IDs; counting on gene features is safer.
+        return ["-F", "GFF", "-t", "gene", "-g", "ID"]
+    return ["-F", "GTF", "-t", "exon", "-g", "gene_id"]
+
+
 def discover_samples(reads_dir: Path):
     reads = sorted(reads_dir.glob("*.fastq.gz")) + sorted(reads_dir.glob("*.fq.gz"))
     if not reads:
@@ -213,11 +242,13 @@ def align_and_count(args):
 
     count_file = counts_dir / "featureCounts.txt"
     if not should_skip(count_file, args.resume, "featureCounts output"):
+        annotation_args = featurecounts_annotation_args(gff)
         run_cmd(
             [
                 "featureCounts",
                 "-T",
                 str(args.threads),
+                *annotation_args,
                 "-a",
                 str(gff),
                 "-o",
