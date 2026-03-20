@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import urlretrieve
 
@@ -115,6 +116,18 @@ def featurecounts_annotation_args(annotation_path: Path):
         # For many GFF3s, exon Parent points to transcript IDs; counting on gene features is safer.
         return ["-F", "GFF", "-t", "gene", "-g", "ID"]
     return ["-F", "GTF", "-t", "exon", "-g", "gene_id"]
+
+
+def canonical_sample_id(name: str) -> str:
+    sample = str(name).strip()
+    sample = Path(sample).name
+    for suffix in [".sorted.bam", ".bam", ".fastq.gz", ".fq.gz", ".fastq", ".fq"]:
+        if sample.endswith(suffix):
+            sample = sample[: -len(suffix)]
+    for tag in ["_R1", "_R2"]:
+        if tag in sample:
+            sample = sample.split(tag)[0]
+    return sample
 
 
 def discover_samples(reads_dir: Path):
@@ -268,6 +281,10 @@ def align_and_count(args):
         clean.to_csv(clean_out, sep="\t", index=False)
         print(f"Counts matrix written: {clean_out}")
 
+    counts_for_plots = clean.set_index("gene_id").T.astype(int)
+    write_pca(counts_for_plots, None, None, counts_dir, args.resume)
+    write_heatmap(counts_for_plots, counts_dir, args.resume)
+
     if args.metadata and args.condition_column:
         run_deseq(
             clean_out,
@@ -290,18 +307,36 @@ def _sample_ordered_counts_and_metadata(counts_matrix: Path, metadata_path: Path
         raise ValueError(f"Metadata missing condition column: {condition_col}")
 
     counts_df = counts_df.set_index("gene_id").T
-    counts_df.index.name = "sample"
+    counts_df.index = pd.Index([canonical_sample_id(s) for s in counts_df.index], name="sample")
     counts_df = counts_df.astype(int)
 
-    common = counts_df.index.intersection(meta_df["sample"])
+    meta_df = meta_df.copy()
+    meta_df["sample"] = meta_df["sample"].astype(str)
+    meta_df["_sample_canonical"] = meta_df["sample"].map(canonical_sample_id)
+
+    # Keep first metadata row per canonical sample to avoid ambiguous joins.
+    meta_df = meta_df.drop_duplicates(subset="_sample_canonical", keep="first")
+    meta_df = meta_df.set_index("_sample_canonical")
+
+    common = counts_df.index.intersection(meta_df.index)
     if len(common) < 2:
-        raise ValueError("No overlapping samples between counts and metadata.")
+        raise ValueError(
+            "No overlapping samples between counts and metadata after normalization. "
+            "Ensure metadata 'sample' values match FASTQ/BAM-derived sample names."
+        )
     counts_df = counts_df.loc[common]
-    meta_df = meta_df.set_index("sample").loc[common]
+    meta_df = meta_df.loc[common]
+    meta_df.index.name = "sample"
     return counts_df, meta_df
 
 
-def write_pca(counts_df: pd.DataFrame, meta_df: pd.DataFrame, condition_col: str, out_dir: Path, resume: bool):
+def write_pca(
+    counts_df: pd.DataFrame,
+    meta_df: Optional[pd.DataFrame],
+    condition_col: Optional[str],
+    out_dir: Path,
+    resume: bool,
+):
     import matplotlib.pyplot as plt
     import numpy as np
 
@@ -317,29 +352,64 @@ def write_pca(counts_df: pd.DataFrame, meta_df: pd.DataFrame, condition_col: str
     pc_scores = u[:, :2] * s[:2]
     var_exp = (s ** 2) / max((x.shape[0] - 1), 1)
     var_exp_ratio = var_exp / max(var_exp.sum(), 1e-12)
+    use_groups = bool(meta_df is not None and condition_col and condition_col in meta_df.columns)
     pca_df = pd.DataFrame(
         {
             "sample": counts_df.index,
             "PC1": pc_scores[:, 0] if pc_scores.shape[1] > 0 else 0.0,
             "PC2": pc_scores[:, 1] if pc_scores.shape[1] > 1 else 0.0,
-            condition_col: meta_df[condition_col].values,
+            (condition_col if use_groups else "group"): (
+                meta_df[condition_col].astype(str).values if use_groups else "all_samples"
+            ),
         }
     )
     pca_df.to_csv(pca_tsv, sep="\t", index=False)
 
+    group_col = condition_col if use_groups else "group"
     fig, ax = plt.subplots(figsize=(6, 5))
-    for cond, group in pca_df.groupby(condition_col):
+    for cond, group in pca_df.groupby(group_col):
         ax.scatter(group["PC1"], group["PC2"], label=str(cond), s=70, alpha=0.85)
         for _, row in group.iterrows():
             ax.annotate(row["sample"], (row["PC1"], row["PC2"]), fontsize=8, alpha=0.85)
     ax.set_xlabel(f"PC1 ({var_exp_ratio[0] * 100:.1f}% var)" if len(var_exp_ratio) > 0 else "PC1")
     ax.set_ylabel(f"PC2 ({var_exp_ratio[1] * 100:.1f}% var)" if len(var_exp_ratio) > 1 else "PC2")
     ax.set_title("PCA of samples (log2 counts + 1)")
-    ax.legend()
+    if use_groups:
+        ax.legend()
     fig.tight_layout()
     fig.savefig(pca_png, dpi=180)
     plt.close(fig)
     print(f"PCA outputs written: {pca_tsv}, {pca_png}")
+
+
+def write_heatmap(counts_df: pd.DataFrame, out_dir: Path, resume: bool, top_n: int = 50):
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    heatmap_png = out_dir / "heatmap_top_variable_genes.png"
+    if should_skip(heatmap_png, resume, "heatmap"):
+        return
+    if counts_df.empty or counts_df.shape[0] < 2 or counts_df.shape[1] < 2:
+        print("Skipping heatmap: need at least 2 samples and 2 genes.")
+        return
+
+    x = np.log2(counts_df + 1.0)
+    top_genes = x.var(axis=0).sort_values(ascending=False).head(max(top_n, 2)).index
+    z = x[top_genes]
+    z = (z - z.mean(axis=0)) / z.std(axis=0).replace(0, 1)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    im = ax.imshow(z.T.to_numpy(), aspect="auto", interpolation="nearest", cmap="viridis")
+    ax.set_title("Top variable genes (z-scored log2 counts)")
+    ax.set_xlabel("Samples")
+    ax.set_ylabel("Genes")
+    ax.set_xticks(range(len(z.index)))
+    ax.set_xticklabels(z.index, rotation=90, fontsize=7)
+    fig.colorbar(im, ax=ax, label="z-score")
+    fig.tight_layout()
+    fig.savefig(heatmap_png, dpi=180)
+    plt.close(fig)
+    print(f"Heatmap written: {heatmap_png}")
 
 
 def write_volcano(deseq_df: pd.DataFrame, out_dir: Path, resume: bool):
@@ -432,24 +502,39 @@ def run_deseq(
     from pydeseq2.dds import DeseqDataSet
     from pydeseq2.ds import DeseqStats
 
-    counts_df, meta_df = _sample_ordered_counts_and_metadata(counts_matrix, metadata_path, condition_col)
+    try:
+        counts_df, meta_df = _sample_ordered_counts_and_metadata(counts_matrix, metadata_path, condition_col)
+    except Exception as exc:
+        print(f"Skipping DE/volcano because metadata matching failed: {exc}")
+        return
 
     out = out_dir / "deseq2_results.tsv"
-    if should_skip(out, resume, "DESeq2 results"):
-        res = pd.read_csv(out, sep="\t")
-    else:
-        dds = DeseqDataSet(counts=counts_df, metadata=meta_df, design_factors=condition_col)
-        dds.deseq2()
-        stats = DeseqStats(dds, n_cpus=1)
-        stats.summary()
-        res = stats.results_df.reset_index().rename(columns={"index": "gene_id"})
-        res.to_csv(out, sep="\t", index=False)
-        print(f"Differential expression results written: {out}")
+    try:
+        if should_skip(out, resume, "DESeq2 results"):
+            res = pd.read_csv(out, sep="\t")
+        else:
+            dds = DeseqDataSet(counts=counts_df, metadata=meta_df, design_factors=condition_col)
+            dds.deseq2()
+            stats = DeseqStats(dds, n_cpus=1)
+            stats.summary()
+            res = stats.results_df.reset_index().rename(columns={"index": "gene_id"})
+            res.to_csv(out, sep="\t", index=False)
+            print(f"Differential expression results written: {out}")
+    except Exception as exc:
+        print(f"Skipping DE/volcano because DESeq2 failed: {exc}")
+        return
 
     write_pca(counts_df, meta_df, condition_col, out_dir, resume)
-    write_volcano(res, out_dir, resume)
+    write_heatmap(counts_df, out_dir, resume)
+    try:
+        write_volcano(res, out_dir, resume)
+    except Exception as exc:
+        print(f"Skipping volcano plot: {exc}")
     if gsea_gmt:
-        run_gsea(res, gsea_gmt, out_dir, resume, gsea_min_size, gsea_max_size)
+        try:
+            run_gsea(res, gsea_gmt, out_dir, resume, gsea_min_size, gsea_max_size)
+        except Exception as exc:
+            print(f"Skipping GSEA: {exc}")
 
 
 def build_parser():
