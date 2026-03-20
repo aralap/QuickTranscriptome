@@ -1,0 +1,14 @@
+name: quicktranscriptome
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.11
+  - minimap2
+  - samtools
+  - subread
+  - pandas
+  - pyyaml
+  - requests
+  - scipy
+  - pydeseq2
