@@ -14,6 +14,14 @@ from urllib.request import urlretrieve
 import pandas as pd
 
 
+def normalize_gene_identifier(raw: str) -> str:
+    """Match GFF/featureCounts IDs to CGD GAF symbols (strip Ensembl-style gene: prefix)."""
+    s = str(raw).strip()
+    if s.lower().startswith("gene:"):
+        return s[5:].lstrip()
+    return s
+
+
 SPECIES_DEFAULTS = {
     "parapsilosis": {
         "fasta_urls": [
@@ -222,8 +230,11 @@ def _build_gmt_from_gaf(gaf_path: Path, gmt_path: Path) -> Path:
             go_id = parts[4].strip()
             if not go_id:
                 continue
-            # Prefer stable object ID for better matching to gene_id-style counts.
-            gene_id = parts[1].strip() or parts[2].strip()
+            # CGD: col2 = CAL object ID, col3 = systematic gene symbol (CPAR2_*).
+            # Count matrices use the same symbols as GFF gene IDs, not CAL IDs.
+            symbol = parts[2].strip() if len(parts) > 2 else ""
+            obj_id = parts[1].strip() if len(parts) > 1 else ""
+            gene_id = normalize_gene_identifier(symbol or obj_id)
             if not gene_id:
                 continue
             go_to_genes[go_id].add(gene_id)
@@ -254,7 +265,8 @@ def resolve_gsea_gmt(
 
     gsea_ref_dir = refs_dir / "gsea"
     ensure_dir(gsea_ref_dir)
-    gmt_out = gsea_ref_dir / f"{species}_go_from_gaf.gmt"
+    # Suffix distinguishes symbol-based GMT from older CAL-ID caches.
+    gmt_out = gsea_ref_dir / f"{species}_go_from_gaf_symbol.gmt"
     if should_skip(gmt_out, resume, "auto-generated GSEA GMT"):
         return str(gmt_out)
 
@@ -355,7 +367,7 @@ def align_and_count(args):
     sample_cols = [c for c in df.columns if c not in fixed_cols]
     clean = df[["Geneid", *sample_cols]].copy()
     clean.columns = ["gene_id", *[Path(c).stem.replace(".sorted", "") for c in sample_cols]]
-    clean["gene_id"] = clean["gene_id"].astype(str).str.replace("^gene:", "", regex=True)
+    clean["gene_id"] = clean["gene_id"].map(normalize_gene_identifier)
     clean_out = counts_dir / "counts_matrix.tsv"
     if not should_skip(clean_out, args.resume, "counts matrix"):
         clean.to_csv(clean_out, sep="\t", index=False)
@@ -620,6 +632,8 @@ def run_gsea(
         print("Skipping GSEA: no suitable ranking column ('stat' or 'log2FoldChange').")
         return
     ranking = deseq_df[["gene_id", rank_col]].copy()
+    ranking["gene_id"] = ranking["gene_id"].map(normalize_gene_identifier)
+    ranking = ranking.drop_duplicates(subset=["gene_id"], keep="first")
     ranking[rank_col] = pd.to_numeric(ranking[rank_col], errors="coerce")
     ranking = ranking.dropna().sort_values(rank_col, ascending=False)
     if ranking.empty:

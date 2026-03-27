@@ -1,0 +1,10 @@
+# Python packages for quicktranscriptome.py (Python 3.11+).
+# Install system/CLI tools separately: minimap2, samtools, subread (featureCounts), or use environment.yml.
+pandas
+numpy
+matplotlib
+pyyaml
+requests
+scipy
+pydeseq2
+gseapy
