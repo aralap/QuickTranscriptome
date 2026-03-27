@@ -913,10 +913,28 @@ def write_de_top_heatmap(
         return
 
     de = deseq_df.copy()
-    de["gene_id"] = de["gene_id"].map(normalize_gene_identifier)
+    de["gene_id"] = de["gene_id"].astype(str).str.strip().map(normalize_gene_identifier)
     de["padj"] = pd.to_numeric(de["padj"], errors="coerce")
     de["log2FoldChange"] = pd.to_numeric(de["log2FoldChange"], errors="coerce")
     de = de.dropna(subset=["log2FoldChange"])
+
+    # Map normalized gene id -> actual column name in counts (PyDESeq2/CSV may differ slightly from matrix cols).
+    col_by_norm: dict[str, str] = {}
+    for c in counts_df.columns:
+        key = normalize_gene_identifier(str(c))
+        if key not in col_by_norm:
+            col_by_norm[key] = str(c)
+
+    def _to_count_col(g) -> Optional[str]:
+        if g is None or pd.isna(g):
+            return None
+        key = normalize_gene_identifier(str(g).strip())
+        if key in col_by_norm:
+            return col_by_norm[key]
+        gs = str(g).strip()
+        if gs in counts_df.columns:
+            return gs
+        return None
 
     sig = de["padj"].notna() & (de["padj"] < padj_cutoff)
     pos = de.loc[sig & (de["log2FoldChange"] > 0)].sort_values("log2FoldChange", ascending=False)
@@ -933,16 +951,36 @@ def write_de_top_heatmap(
         neg = neg.head(top_per_direction)
 
     gene_ids_raw = list(neg["gene_id"]) + list(pos["gene_id"])
-    gene_ids = []
+    gene_ids: list[str] = []
     seen: set[str] = set()
     for g in gene_ids_raw:
-        if g in seen:
+        col = _to_count_col(g)
+        if col is None or col in seen:
             continue
-        seen.add(g)
-        if g in counts_df.columns:
-            gene_ids.append(g)
+        seen.add(col)
+        gene_ids.append(col)
+
     if len(gene_ids) < 2:
-        print("Skipping DE heatmap: not enough DE genes matched to count matrix.")
+        pool = de.copy()
+        pool["_abs_lfc"] = pool["log2FoldChange"].abs()
+        pool = pool.sort_values("_abs_lfc", ascending=False)
+        for _, row in pool.iterrows():
+            col = _to_count_col(row["gene_id"])
+            if col is None or col in seen:
+                continue
+            seen.add(col)
+            gene_ids.append(col)
+            if len(gene_ids) >= max(2, min(2 * top_per_direction, 50)):
+                break
+
+    if len(gene_ids) < 2:
+        ex_de = de["gene_id"].head(3).tolist()
+        ex_ct = [normalize_gene_identifier(str(c)) for c in counts_df.columns[:3]]
+        print(
+            "Skipping DE heatmap: fewer than two genes from DESeq2 results could be matched to count-matrix "
+            f"columns (check gene_id consistency). Example DE gene_ids: {ex_de}; "
+            f"example count columns (normalized): {ex_ct}."
+        )
         return
 
     x = np.log2(counts_df + 1.0)
