@@ -391,6 +391,9 @@ def align_and_count(args):
             gsea_gmt,
             args.gsea_min_size,
             args.gsea_max_size,
+            args.gsea_dotplot_max_terms,
+            args.de_heatmap_top_per,
+            args.de_heatmap_padj,
         )
     else:
         write_pca(counts_for_plots, None, None, counts_dir, args.resume)
@@ -572,6 +575,114 @@ def write_heatmap(
     print(f"Heatmap written: {heatmap_png}")
 
 
+def write_de_top_heatmap(
+    counts_df: pd.DataFrame,
+    meta_df: pd.DataFrame,
+    condition_col: str,
+    deseq_df: pd.DataFrame,
+    out_dir: Path,
+    resume: bool,
+    top_per_direction: int,
+    padj_cutoff: float,
+    numerator_level: str,
+    denominator_level: str,
+):
+    """Heatmap of log2 counts (z-scored per gene) for top genes up/down in the DESeq2 contrast."""
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    heatmap_png = out_dir / "heatmap_top_de_genes.png"
+    if should_skip(heatmap_png, resume, "DE top genes heatmap"):
+        return
+    if counts_df.empty or counts_df.shape[0] < 2:
+        print("Skipping DE heatmap: need at least 2 samples.")
+        return
+    if "padj" not in deseq_df.columns or "log2FoldChange" not in deseq_df.columns:
+        print("Skipping DE heatmap: DESeq2 columns 'padj'/'log2FoldChange' not found.")
+        return
+
+    de = deseq_df.copy()
+    de["gene_id"] = de["gene_id"].map(normalize_gene_identifier)
+    de["padj"] = pd.to_numeric(de["padj"], errors="coerce")
+    de["log2FoldChange"] = pd.to_numeric(de["log2FoldChange"], errors="coerce")
+    de = de.dropna(subset=["log2FoldChange"])
+
+    sig = de["padj"].notna() & (de["padj"] < padj_cutoff)
+    pos = de.loc[sig & (de["log2FoldChange"] > 0)].sort_values("log2FoldChange", ascending=False)
+    neg = de.loc[sig & (de["log2FoldChange"] < 0)].sort_values("log2FoldChange", ascending=True)
+
+    if len(pos) < top_per_direction:
+        pos = de.loc[de["log2FoldChange"] > 0].sort_values("log2FoldChange", ascending=False).head(top_per_direction)
+    else:
+        pos = pos.head(top_per_direction)
+
+    if len(neg) < top_per_direction:
+        neg = de.loc[de["log2FoldChange"] < 0].sort_values("log2FoldChange", ascending=True).head(top_per_direction)
+    else:
+        neg = neg.head(top_per_direction)
+
+    gene_ids_raw = list(neg["gene_id"]) + list(pos["gene_id"])
+    gene_ids = []
+    seen: set[str] = set()
+    for g in gene_ids_raw:
+        if g in seen:
+            continue
+        seen.add(g)
+        if g in counts_df.columns:
+            gene_ids.append(g)
+    if len(gene_ids) < 2:
+        print("Skipping DE heatmap: not enough DE genes matched to count matrix.")
+        return
+
+    x = np.log2(counts_df + 1.0)
+    if meta_df is not None and condition_col and condition_col in meta_df.columns:
+        common = x.index.intersection(meta_df.index)
+        if len(common) >= 2:
+            order = (
+                meta_df.loc[common, condition_col]
+                .astype(str)
+                .sort_values()
+                .index
+            )
+            x = x.loc[order]
+
+    z = x[gene_ids]
+    z = (z - z.mean(axis=0)) / z.std(axis=0).replace(0, 1)
+
+    fig_h = min(max(5.0, 0.22 * len(gene_ids) + 2.0), 100.0)
+    fig, ax = plt.subplots(figsize=(10, fig_h))
+    arr = z.T.to_numpy()
+    vmax = float(np.nanpercentile(np.abs(arr), 99)) if np.isfinite(arr).any() else 3.0
+    vmax = max(vmax, 0.5)
+    im = ax.imshow(
+        arr,
+        aspect="auto",
+        interpolation="nearest",
+        cmap="RdBu_r",
+        vmin=-vmax,
+        vmax=vmax,
+    )
+    ax.set_title(
+        f"Top DE genes (z-scored log2 counts)\n"
+        f"positive log2FC = higher in {numerator_level} vs {denominator_level}"
+    )
+    ax.set_xlabel("Samples")
+    ax.set_ylabel("Genes (downregulated, then upregulated)")
+    ax.set_xticks(range(len(z.index)))
+    if meta_df is not None and condition_col and condition_col in meta_df.columns:
+        sample_labels = [f"{s} ({meta_df.loc[s, condition_col]})" for s in z.index]
+        ax.set_xticklabels(sample_labels, rotation=90, fontsize=7)
+    else:
+        ax.set_xticklabels(z.index, rotation=90, fontsize=7)
+    ax.set_yticks(range(len(gene_ids)))
+    ax.set_yticklabels(gene_ids, fontsize=max(5, 8 - len(gene_ids) // 40))
+    fig.colorbar(im, ax=ax, label="z-score (per gene)")
+    fig.tight_layout()
+    fig.savefig(heatmap_png, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"DE top genes heatmap written: {heatmap_png}")
+
+
 def write_volcano(deseq_df: pd.DataFrame, out_dir: Path, resume: bool):
     import matplotlib.pyplot as plt
     import numpy as np
@@ -608,6 +719,101 @@ def write_volcano(deseq_df: pd.DataFrame, out_dir: Path, resume: bool):
     print(f"Volcano plot written: {volcano_png}")
 
 
+def write_gsea_nes_dotplot(
+    report_path: Path,
+    out_path: Path,
+    resume: bool,
+    max_terms: int,
+):
+    """Scatter of NES vs GO terms; marker area scales with significance (-log10 p)."""
+    if should_skip(out_path, resume, "GSEA NES dot plot"):
+        return
+    if not report_path.exists():
+        print("Skipping GSEA dot plot: report CSV not found.")
+        return
+
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    df = pd.read_csv(report_path)
+    if df.empty:
+        print("Skipping GSEA dot plot: empty report.")
+        return
+
+    term_col = "Term" if "Term" in df.columns else df.columns[0]
+    if "NES" not in df.columns:
+        print("Skipping GSEA dot plot: no NES column in report.")
+        return
+
+    nes = pd.to_numeric(df["NES"], errors="coerce")
+    terms = df[term_col].astype(str)
+    df_plot = pd.DataFrame({"term": terms, "nes": nes}).dropna(subset=["nes"])
+    if df_plot.empty:
+        print("Skipping GSEA dot plot: no valid NES values.")
+        return
+
+    df_plot["_abs"] = df_plot["nes"].abs()
+    df_plot = df_plot.sort_values("_abs", ascending=False)
+    if max_terms > 0 and len(df_plot) > max_terms:
+        df_plot = df_plot.head(max_terms)
+        print(f"GSEA dot plot: showing top {max_terms} terms by |NES|.")
+    elif len(df_plot) > 400:
+        print(
+            f"GSEA dot plot: {len(df_plot)} terms; consider --gsea-dotplot-max-terms "
+            "for a smaller figure."
+        )
+
+    df_plot = df_plot.sort_values("nes", ascending=True).reset_index(drop=True)
+
+    p_col = next(
+        (c for c in ("NOM p-val", "FDR q-val", "FWER p-val") if c in df.columns),
+        None,
+    )
+    if p_col is not None:
+        _pv = df[[term_col, p_col]].drop_duplicates(subset=[term_col])
+        _pv[term_col] = _pv[term_col].astype(str)
+        pmap = _pv.set_index(term_col)[p_col]
+        pvals = df_plot["term"].map(pmap)
+        pvals = pd.to_numeric(pvals, errors="coerce").fillna(1.0).clip(lower=1e-300)
+        size_metric = -np.log10(pvals.to_numpy(dtype=float))
+        size_label = f"-log10({p_col})"
+    else:
+        size_metric = df_plot["nes"].abs().to_numpy(dtype=float)
+        size_label = "|NES| (no p-values in report)"
+        print("GSEA dot plot: using |NES| for marker size (no p-value column found).")
+
+    smin, smax = 18.0, 220.0
+    sm = np.asarray(size_metric, dtype=float)
+    valid = np.isfinite(sm)
+    if not valid.any():
+        sm = np.ones(len(df_plot)) * ((smin + smax) / 2)
+    else:
+        lo, hi = np.nanmin(sm[valid]), np.nanmax(sm[valid])
+        if hi <= lo:
+            sm = np.full(len(df_plot), (smin + smax) / 2)
+        else:
+            sm = np.where(valid, smin + (sm - lo) / (hi - lo) * (smax - smin), (smin + smax) / 2)
+
+    y = np.arange(len(df_plot))
+    fig_h = min(max(5.0, 0.22 * len(df_plot) + 1.5), 120.0)
+    fig, ax = plt.subplots(figsize=(9, fig_h))
+    colors = np.where(df_plot["nes"].to_numpy() >= 0, "#c0392b", "#2980b9")
+    ax.scatter(df_plot["nes"], y, s=sm, c=colors, alpha=0.85, edgecolors="white", linewidths=0.4)
+    ax.axvline(0.0, color="0.45", linewidth=0.9, linestyle="--")
+    ax.set_yticks(y)
+    labels = df_plot["term"].tolist()
+    if len(labels) and all(s.startswith("GO:") for s in labels[: min(5, len(labels))]):
+        labels = [s.replace("GO:", "") for s in labels]
+    ax.set_yticklabels(labels, fontsize=max(5, 9 - len(df_plot) // 80))
+    ax.set_xlabel("NES (normalized enrichment score)")
+    ax.set_ylabel("Gene set (GO term)")
+    ax.set_title(f"GSEA prerank ({len(df_plot)} terms; marker size ∝ {size_label})")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"GSEA NES dot plot written: {out_path}")
+
+
 def run_gsea(
     deseq_df: pd.DataFrame,
     gsea_gmt: str,
@@ -615,40 +821,52 @@ def run_gsea(
     resume: bool,
     gsea_min_size: int,
     gsea_max_size: int,
+    gsea_dotplot_max_terms: int,
 ):
     gsea_dir = out_dir / "gsea"
     ensure_dir(gsea_dir)
-    marker = gsea_dir / "gseapy.gene_set.prerank.report.csv"
-    if should_skip(marker, resume, "GSEA report"):
-        return
-    try:
-        import gseapy as gp
-    except ImportError:
-        print("Skipping GSEA: gseapy is not installed. Add it to environment to enable GSEA.")
+    report = gsea_dir / "gseapy.gene_set.prerank.report.csv"
+    dotplot_png = gsea_dir / "gsea_prerank_nes_dotplot.png"
+
+    skip_prerank = resume and report.exists()
+    if skip_prerank:
+        print(f"Resume enabled: using existing GSEA report: {report}")
+
+    if not skip_prerank:
+        try:
+            import gseapy as gp
+        except ImportError:
+            print("Skipping GSEA: gseapy is not installed. Add it to environment to enable GSEA.")
+            return
+
+        rank_col = "stat" if "stat" in deseq_df.columns else "log2FoldChange"
+        if rank_col not in deseq_df.columns:
+            print("Skipping GSEA: no suitable ranking column ('stat' or 'log2FoldChange').")
+            return
+        ranking = deseq_df[["gene_id", rank_col]].copy()
+        ranking["gene_id"] = ranking["gene_id"].map(normalize_gene_identifier)
+        ranking = ranking.drop_duplicates(subset=["gene_id"], keep="first")
+        ranking[rank_col] = pd.to_numeric(ranking[rank_col], errors="coerce")
+        ranking = ranking.dropna().sort_values(rank_col, ascending=False)
+        if ranking.empty:
+            print("Skipping GSEA: ranking table is empty.")
+            return
+        gp.prerank(
+            rnk=ranking,
+            gene_sets=gsea_gmt,
+            outdir=str(gsea_dir),
+            min_size=gsea_min_size,
+            max_size=gsea_max_size,
+            seed=42,
+            verbose=True,
+        )
+        print(f"GSEA outputs written: {gsea_dir}")
+
+    if not report.exists():
+        print("Skipping GSEA dot plot: no GSEA report CSV.")
         return
 
-    rank_col = "stat" if "stat" in deseq_df.columns else "log2FoldChange"
-    if rank_col not in deseq_df.columns:
-        print("Skipping GSEA: no suitable ranking column ('stat' or 'log2FoldChange').")
-        return
-    ranking = deseq_df[["gene_id", rank_col]].copy()
-    ranking["gene_id"] = ranking["gene_id"].map(normalize_gene_identifier)
-    ranking = ranking.drop_duplicates(subset=["gene_id"], keep="first")
-    ranking[rank_col] = pd.to_numeric(ranking[rank_col], errors="coerce")
-    ranking = ranking.dropna().sort_values(rank_col, ascending=False)
-    if ranking.empty:
-        print("Skipping GSEA: ranking table is empty.")
-        return
-    gp.prerank(
-        rnk=ranking,
-        gene_sets=gsea_gmt,
-        outdir=str(gsea_dir),
-        min_size=gsea_min_size,
-        max_size=gsea_max_size,
-        seed=42,
-        verbose=True,
-    )
-    print(f"GSEA outputs written: {gsea_dir}")
+    write_gsea_nes_dotplot(report, dotplot_png, resume, gsea_dotplot_max_terms)
 
 
 def run_deseq(
@@ -660,6 +878,9 @@ def run_deseq(
     gsea_gmt: str,
     gsea_min_size: int,
     gsea_max_size: int,
+    gsea_dotplot_max_terms: int,
+    de_heatmap_top_per: int,
+    de_heatmap_padj: float,
 ):
     from pydeseq2.dds import DeseqDataSet
     from pydeseq2.ds import DeseqStats
@@ -724,9 +945,35 @@ def run_deseq(
         write_volcano(res, out_dir, resume)
     except Exception as exc:
         print(f"Skipping volcano plot: {exc}")
+    levels_plot = [str(v) for v in pd.Series(meta_df[condition_col]).dropna().astype(str).unique().tolist()]
+    num_l = levels_plot[1] if len(levels_plot) >= 2 else "?"
+    den_l = levels_plot[0] if len(levels_plot) >= 2 else "?"
+    try:
+        write_de_top_heatmap(
+            counts_df,
+            meta_df,
+            condition_col,
+            res,
+            out_dir,
+            resume,
+            de_heatmap_top_per,
+            de_heatmap_padj,
+            num_l,
+            den_l,
+        )
+    except Exception as exc:
+        print(f"Skipping DE top genes heatmap: {exc}")
     if gsea_gmt:
         try:
-            run_gsea(res, gsea_gmt, out_dir, resume, gsea_min_size, gsea_max_size)
+            run_gsea(
+                res,
+                gsea_gmt,
+                out_dir,
+                resume,
+                gsea_min_size,
+                gsea_max_size,
+                gsea_dotplot_max_terms,
+            )
         except Exception as exc:
             print(f"Skipping GSEA: {exc}")
 
@@ -770,6 +1017,24 @@ def build_parser():
     )
     run_p.add_argument("--gsea-min-size", type=int, default=10, help="Minimum gene-set size for GSEA.")
     run_p.add_argument("--gsea-max-size", type=int, default=500, help="Maximum gene-set size for GSEA.")
+    run_p.add_argument(
+        "--gsea-dotplot-max-terms",
+        type=int,
+        default=0,
+        help="Max GO terms on the combined NES dot plot (0 = plot all terms in the report).",
+    )
+    run_p.add_argument(
+        "--de-heatmap-top-per",
+        type=int,
+        default=25,
+        help="How many top up- and top down-regulated genes to show on the DE heatmap (each direction).",
+    )
+    run_p.add_argument(
+        "--de-heatmap-padj",
+        type=float,
+        default=0.05,
+        help="Adjusted p-value cutoff when choosing top DE genes for the DE heatmap.",
+    )
     run_p.set_defaults(func=align_and_count)
     return parser
 
