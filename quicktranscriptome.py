@@ -3,6 +3,7 @@ import argparse
 import base64
 import gzip
 import html
+import json
 import math
 import shutil
 import subprocess
@@ -12,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.error import HTTPError, URLError
-from urllib.request import urlretrieve
+from urllib.request import Request, urlretrieve, urlopen
 
 import pandas as pd
 
@@ -23,6 +24,42 @@ def normalize_gene_identifier(raw: str) -> str:
     if s.lower().startswith("gene:"):
         return s[5:].lstrip()
     return s
+
+
+def _fetch_go_term_names(go_ids: list[str]) -> dict[str, str]:
+    """Map GO:xxxxxx to term names via QuickGO (best effort; offline returns {})."""
+    uniq = sorted({g.strip() for g in go_ids if str(g).strip().startswith("GO:")})
+    if not uniq:
+        return {}
+    out: dict[str, str] = {}
+    chunk = 40
+    for i in range(0, len(uniq), chunk):
+        part = uniq[i : i + chunk]
+        url = "https://www.ebi.ac.uk/QuickGO/services/ontology/go/terms/" + ",".join(part)
+        try:
+            req = Request(url, headers={"Accept": "application/json"})
+            with urlopen(req, timeout=45) as resp:
+                data = json.loads(resp.read().decode())
+            for t in data.get("results", []):
+                tid = t.get("id")
+                name = t.get("name")
+                if tid and name:
+                    out[str(tid)] = str(name)
+        except (HTTPError, URLError, OSError, TimeoutError, ValueError, json.JSONDecodeError):
+            pass
+    return out
+
+
+def _format_go_axis_label(term: str, name_by_id: dict[str, str]) -> str:
+    t = str(term).strip()
+    if t.startswith("GO:") and t in name_by_id:
+        return f"{name_by_id[t]} ({t})"
+    return t
+
+
+def _truncate_label(s: str, max_len: int = 72) -> str:
+    s = str(s)
+    return s if len(s) <= max_len else s[: max_len - 1] + "…"
 
 
 SPECIES_DEFAULTS = {
@@ -279,25 +316,98 @@ def resolve_gsea_gmt(
     return str(gmt_out)
 
 
-def _summary_plot_candidates(counts_dir: Path) -> list[tuple[str, Path]]:
+def _summary_plot_candidates(counts_dir: Path) -> list[tuple[str, Path, str]]:
+    """Title, path, short description for report."""
     return [
-        ("PCA", counts_dir / "pca_plot.png"),
-        ("Top variable genes", counts_dir / "heatmap_top_variable_genes.png"),
-        ("Volcano (DESeq2)", counts_dir / "volcano_plot.png"),
-        ("Top DE genes", counts_dir / "heatmap_top_de_genes.png"),
-        ("GSEA prerank (NES)", counts_dir / "gsea" / "gsea_prerank_nes_dotplot.png"),
+        (
+            "PCA",
+            counts_dir / "pca_plot.png",
+            "Principal components on log2(counts+1), mean-centered. Samples separate in PC space when "
+            "replicates of the same condition cluster together.",
+        ),
+        (
+            "Top variable genes",
+            counts_dir / "heatmap_top_variable_genes.png",
+            "Genes with the highest variance across samples (after log2 transform), z-scored per gene. "
+            "Highlights global sample-to-sample heterogeneity before differential testing.",
+        ),
+        (
+            "Volcano (DESeq2)",
+            counts_dir / "volcano_plot.png",
+            "Effect size (log2 fold change) versus significance (-log10 adjusted p-value). "
+            "Labels mark the 20 genes with smallest adjusted p-value. "
+            "Horizontal lines mark typical padj and |log2FC| cutoffs used for visualization.",
+        ),
+        (
+            "Top DE genes",
+            counts_dir / "heatmap_top_de_genes.png",
+            "Top up- and down-regulated genes from DESeq2 (see contrast in title), z-scored log2 counts. "
+            "Rows: genes; columns: samples ordered by condition.",
+        ),
+        (
+            "GSEA prerank (NES)",
+            counts_dir / "gsea" / "gsea_prerank_nes_dotplot.png",
+            "Gene-set enrichment using ranks from DESeq2. Shows the five most negative and five most "
+            "positive NES terms; y-axis labels use GO names from QuickGO when online. "
+            "Marker size reflects significance (-log10 p). Red = positive NES, blue = negative.",
+        ),
     ]
 
 
+def _collect_run_summary_stats(out_dir: Path, counts_dir: Path, args: argparse.Namespace) -> list[tuple[str, str]]:
+    """Key/value rows for the summary table."""
+    rows: list[tuple[str, str]] = []
+    cm = counts_dir / "counts_matrix.tsv"
+    if cm.exists():
+        try:
+            header = cm.read_text(encoding="utf-8", errors="replace").splitlines()[:1]
+            if header:
+                ncols = header[0].count("\t") + 1
+                n_samples = max(0, ncols - 1)
+                rows.append(("Samples in matrix", str(n_samples)))
+            n_lines = sum(1 for _ in cm.open("r", encoding="utf-8", errors="replace")) - 1
+            rows.append(("Genes in count matrix", str(max(0, n_lines))))
+        except OSError:
+            pass
+
+    de_path = counts_dir / "deseq2_results.tsv"
+    if de_path.exists():
+        try:
+            de = pd.read_csv(de_path, sep="\t")
+            if "padj" in de.columns and "log2FoldChange" in de.columns:
+                padj = pd.to_numeric(de["padj"], errors="coerce")
+                lfc = pd.to_numeric(de["log2FoldChange"], errors="coerce")
+                rows.append(("DE genes (padj < 0.05)", str(int(((padj < 0.05) & lfc.notna()).sum()))))
+                rows.append(("DE genes (padj < 0.01)", str(int(((padj < 0.01) & lfc.notna()).sum()))))
+        except (OSError, ValueError):
+            pass
+
+    gsea_rep = counts_dir / "gsea" / "gseapy.gene_set.prerank.report.csv"
+    if gsea_rep.exists():
+        try:
+            gr = pd.read_csv(gsea_rep, sep=",")
+            rows.append(("GSEA gene sets in report", str(len(gr))))
+            if "NES" in gr.columns:
+                nes = pd.to_numeric(gr["NES"], errors="coerce")
+                rows.append(("GSEA sets |NES| max", f"{nes.abs().max():.3f}" if nes.notna().any() else "—"))
+        except (OSError, ValueError):
+            pass
+
+    rows.append(("BAM directory", str((out_dir / "bam").resolve())))
+    rows.append(("Reference index", str((out_dir / "refs" / "reference.mmi").resolve())))
+    return rows
+
+
 def write_run_summary(out_dir: Path, counts_dir: Path, args: argparse.Namespace, resume: bool):
-    """Write one-page HTML and PDF with embedded figures and run metadata."""
+    """Write multi-section HTML and multi-page PDF with figures, table, and short descriptions."""
     html_path = out_dir / "run_summary.html"
     pdf_path = out_dir / "run_summary.pdf"
     if resume and html_path.exists() and pdf_path.exists():
         print(f"Resume enabled: using existing run summary: {html_path}, {pdf_path}")
         return
 
-    plot_items = [(t, p) for t, p in _summary_plot_candidates(counts_dir) if p.is_file()]
+    plot_sections = [(t, p, d) for t, p, d in _summary_plot_candidates(counts_dir) if p.is_file()]
+    stats_rows = _collect_run_summary_stats(out_dir, counts_dir, args)
 
     def _img_data_uri(path: Path) -> str:
         raw = path.read_bytes()
@@ -305,6 +415,7 @@ def write_run_summary(out_dir: Path, counts_dir: Path, args: argparse.Namespace,
         return f"data:image/png;base64,{b64}"
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
     lines = [
         "<!DOCTYPE html>",
         '<html lang="en">',
@@ -312,48 +423,68 @@ def write_run_summary(out_dir: Path, counts_dir: Path, args: argparse.Namespace,
         '<meta charset="utf-8">',
         "<title>QuickTranscriptome run summary</title>",
         "<style>",
-        "body { font-family: system-ui, Segoe UI, sans-serif; margin: 12px; font-size: 13px; color: #222; }",
-        "h1 { font-size: 1.15rem; margin: 0 0 8px 0; }",
-        ".meta { background: #f6f6f6; padding: 10px 12px; border-radius: 6px; margin-bottom: 12px; line-height: 1.45; }",
+        "body { font-family: system-ui, Segoe UI, sans-serif; margin: 16px 20px; font-size: 14px; color: #1a1a1a; line-height: 1.5; max-width: 960px; }",
+        "h1 { font-size: 1.35rem; margin: 0 0 12px 0; }",
+        "h2 { font-size: 1.05rem; margin: 28px 0 8px 0; color: #111; border-bottom: 1px solid #ddd; padding-bottom: 4px; }",
+        "p.desc { margin: 8px 0 12px 0; color: #333; }",
+        ".meta { background: #f4f4f5; padding: 12px 14px; border-radius: 8px; margin-bottom: 20px; line-height: 1.5; }",
         ".meta code { font-size: 12px; word-break: break-all; }",
-        ".grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; align-items: start; }",
-        ".fig { border: 1px solid #ddd; border-radius: 4px; padding: 6px; background: #fff; }",
-        ".fig h2 { font-size: 11px; margin: 0 0 6px 0; font-weight: 600; }",
-        ".fig img { width: 100%; height: auto; max-height: 320px; object-fit: contain; display: block; }",
-        "@media print { body { margin: 0; } .meta { break-inside: avoid; } .fig { break-inside: avoid; } }",
+        "table.stats { border-collapse: collapse; width: 100%; max-width: 640px; margin: 12px 0 24px 0; font-size: 13px; }",
+        "table.stats th, table.stats td { border: 1px solid #ccc; padding: 8px 10px; text-align: left; }",
+        "table.stats th { background: #eee; font-weight: 600; }",
+        "table.stats tr:nth-child(even) { background: #fafafa; }",
+        ".fig { border: 1px solid #ddd; border-radius: 6px; padding: 10px; background: #fff; margin-bottom: 8px; }",
+        ".fig img { width: 100%; height: auto; display: block; object-fit: contain; }",
+        ".fig:not(.gsea) img { max-height: 420px; }",
+        ".fig.gsea img { max-height: none; }",
+        "@media print { .section { page-break-after: always; } .section:last-child { page-break-after: auto; } }",
         "</style>",
         "</head>",
         "<body>",
         "<h1>QuickTranscriptome — run summary</h1>",
-        '<div class="meta">',
-        f"<div><strong>Generated</strong>: {html.escape(now)}</div>",
-        f"<div><strong>Species</strong>: {html.escape(str(args.species))}</div>",
-        f"<div><strong>Reads</strong>: <code>{html.escape(str(Path(args.reads_dir).resolve()))}</code></div>",
-        f"<div><strong>Output</strong>: <code>{html.escape(str(out_dir.resolve()))}</code></div>",
-        f"<div><strong>Threads</strong>: {args.threads}</div>",
+        '<section class="section meta">',
+        f"<p><strong>Generated</strong>: {html.escape(now)}</p>",
+        f"<p><strong>Species</strong>: {html.escape(str(args.species))} &nbsp;|&nbsp; "
+        f"<strong>Threads</strong>: {args.threads}</p>",
+        f"<p><strong>Reads</strong><br><code>{html.escape(str(Path(args.reads_dir).resolve()))}</code></p>",
+        f"<p><strong>Output</strong><br><code>{html.escape(str(out_dir.resolve()))}</code></p>",
     ]
     if args.metadata:
         lines.append(
-            f"<div><strong>Metadata</strong>: <code>{html.escape(str(Path(args.metadata).resolve()))}</code></div>"
-        )
-        lines.append(
-            f"<div><strong>Condition column</strong>: {html.escape(str(args.condition_column))}</div>"
+            f"<p><strong>Metadata</strong><br><code>{html.escape(str(Path(args.metadata).resolve()))}</code><br>"
+            f"Condition column: {html.escape(str(args.condition_column))}</p>"
         )
     else:
-        lines.append("<div><strong>Differential expression</strong>: not run (no metadata)</div>")
-    lines.append(f"<div><strong>GSEA GMT</strong>: {html.escape(str(args.gsea_gmt or '(auto if species default)'))}</div>")
-    lines.append("</div>")
+        lines.append("<p><strong>Differential expression</strong>: not run (no metadata).</p>")
+    lines.append(
+        f"<p><strong>GSEA gene sets (GMT)</strong>: {html.escape(str(args.gsea_gmt or 'auto from species defaults if available'))}</p>"
+    )
+    lines.append("</section>")
 
-    if not plot_items:
-        lines.append("<p>No plot PNGs were found yet under <code>counts/</code> (run may be incomplete).</p>")
+    lines.append('<section class="section">')
+    lines.append("<h2>Run statistics</h2>")
+    lines.append("<p class=\"desc\">Summary metrics from this output folder (counts, DESeq2, GSEA when present).</p>")
+    if stats_rows:
+        lines.append('<table class="stats">')
+        lines.append("<tr><th>Metric</th><th>Value</th></tr>")
+        for k, v in stats_rows:
+            lines.append(f"<tr><td>{html.escape(k)}</td><td>{html.escape(str(v))}</td></tr>")
+        lines.append("</table>")
     else:
-        lines.append('<div class="grid">')
-        for title, path in plot_items:
-            lines.append('<div class="fig">')
+        lines.append("<p>No statistics could be loaded (run may still be in progress).</p>")
+    lines.append("</section>")
+
+    if not plot_sections:
+        lines.append('<section class="section"><h2>Figures</h2><p>No plot PNGs found under <code>counts/</code> yet.</p></section>')
+    else:
+        for title, path, blurb in plot_sections:
+            cls = "fig gsea" if "GSEA" in title else "fig"
+            lines.append('<section class="section">')
             lines.append(f"<h2>{html.escape(title)}</h2>")
+            lines.append(f'<p class="desc">{html.escape(blurb)}</p>')
+            lines.append(f'<div class="{cls}">')
             lines.append(f'<img src="{_img_data_uri(path)}" alt="{html.escape(title)}">')
-            lines.append("</div>")
-        lines.append("</div>")
+            lines.append("</div></section>")
 
     lines.extend(["</body>", "</html>"])
     html_path.write_text("\n".join(lines), encoding="utf-8")
@@ -365,44 +496,92 @@ def write_run_summary(out_dir: Path, counts_dir: Path, args: argparse.Namespace,
         matplotlib.use("Agg")
         import matplotlib.image as mpimg
         import matplotlib.pyplot as plt
-        import numpy as np
+        from matplotlib.backends.backend_pdf import PdfPages
     except ImportError as exc:
         print(f"Skipping run summary PDF (matplotlib unavailable): {exc}")
         return
 
-    n = len(plot_items)
-    if n == 0:
-        fig, ax = plt.subplots(figsize=(8.5, 11))
-        ax.text(
-            0.5,
-            0.5,
-            "No plot PNGs were found for this run.",
-            ha="center",
-            va="center",
-            fontsize=12,
-        )
-        ax.axis("off")
-        fig.savefig(pdf_path, format="pdf", bbox_inches="tight")
-        plt.close(fig)
-        print(f"Run summary PDF written: {pdf_path}")
-        return
+    def _wrap_text(s: str, width: int = 95) -> str:
+        words = s.split()
+        lines_out: list[str] = []
+        cur: list[str] = []
+        n = 0
+        for w in words:
+            if n + len(w) + len(cur) > width and cur:
+                lines_out.append(" ".join(cur))
+                cur = [w]
+                n = len(w)
+            else:
+                cur.append(w)
+                n = sum(len(x) + 1 for x in cur)
+        if cur:
+            lines_out.append(" ".join(cur))
+        return "\n".join(lines_out)
 
-    cols = 2
-    rows = (n + cols - 1) // cols
-    fig_h = min(11.0, max(5.0, 2.15 * rows + 0.8))
-    fig, axes = plt.subplots(rows, cols, figsize=(8.5, fig_h))
-    axes_arr = np.atleast_1d(axes).ravel()
-    for i, (title, path) in enumerate(plot_items):
-        ax = axes_arr[i]
-        img = mpimg.imread(str(path))
-        ax.imshow(img)
-        ax.set_title(title, fontsize=8)
-        ax.axis("off")
-    for j in range(i + 1, len(axes_arr)):
-        axes_arr[j].axis("off")
-    fig.tight_layout()
-    fig.savefig(pdf_path, format="pdf", bbox_inches="tight")
-    plt.close(fig)
+    with PdfPages(pdf_path) as pdf:
+        fig = plt.figure(figsize=(8.5, 11))
+        fig.patch.set_facecolor("white")
+        y = 0.97
+        fig.text(0.08, y, "QuickTranscriptome — run summary", fontsize=15, fontweight="bold")
+        y -= 0.045
+        fig.text(0.08, y, f"Generated: {now}", fontsize=9)
+        y -= 0.028
+        fig.text(0.08, y, f"Species: {args.species}  |  Threads: {args.threads}", fontsize=9)
+        y -= 0.035
+        fig.text(0.08, y, "Reads:", fontsize=9, fontweight="bold")
+        y -= 0.022
+        fig.text(0.08, y, str(Path(args.reads_dir).resolve()), fontsize=7, family="monospace")
+        y -= 0.04
+        fig.text(0.08, y, "Output:", fontsize=9, fontweight="bold")
+        y -= 0.022
+        fig.text(0.08, y, str(out_dir.resolve()), fontsize=7, family="monospace")
+        y -= 0.045
+        if stats_rows:
+            tbl_h = min(0.52, 0.08 + 0.034 * len(stats_rows))
+            ax_tbl = fig.add_axes([0.08, 0.28, 0.84, tbl_h])
+            ax_tbl.axis("off")
+            tbl = ax_tbl.table(
+                cellText=[[a, b] for a, b in stats_rows],
+                colLabels=["Metric", "Value"],
+                loc="upper center",
+                cellLoc="left",
+            )
+            tbl.auto_set_font_size(False)
+            tbl.set_fontsize(8)
+            tbl.scale(1.0, 1.4)
+        else:
+            fig.text(0.08, 0.45, "No statistics table (outputs missing or incomplete).", fontsize=10)
+
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        if not plot_sections:
+            fig2 = plt.figure(figsize=(8.5, 11))
+            fig2.text(0.5, 0.5, "No plot PNGs were found for this run.", ha="center", va="center", fontsize=12)
+            pdf.savefig(fig2)
+            plt.close(fig2)
+        else:
+            for title, path, blurb in plot_sections:
+                figp = plt.figure(figsize=(8.5, 11))
+                figp.patch.set_facecolor("white")
+                figp.text(0.07, 0.98, title, fontsize=13, fontweight="bold", va="top")
+                blurb_short = "\n".join(_wrap_text(blurb, 92).split("\n")[:8])
+                figp.text(
+                    0.07,
+                    0.91,
+                    blurb_short,
+                    fontsize=8.5,
+                    va="top",
+                    ha="left",
+                    linespacing=1.22,
+                )
+                img = mpimg.imread(str(path))
+                ax_img = figp.add_axes([0.06, 0.06, 0.88, 0.72])
+                ax_img.imshow(img, aspect="auto", interpolation="bilinear")
+                ax_img.axis("off")
+                pdf.savefig(figp)
+                plt.close(figp)
+
     print(f"Run summary PDF written: {pdf_path}")
 
 
@@ -836,7 +1015,7 @@ def write_volcano(deseq_df: pd.DataFrame, out_dir: Path, resume: bool):
     plot_df["neg_log10_padj"] = -np.log10(plot_df["padj"].clip(lower=1e-300))
     sig = (plot_df["padj"] < 0.05) & (plot_df["log2FoldChange"].abs() >= 1.0)
 
-    fig, ax = plt.subplots(figsize=(7, 5))
+    fig, ax = plt.subplots(figsize=(8, 6))
     ax.scatter(plot_df.loc[~sig, "log2FoldChange"], plot_df.loc[~sig, "neg_log10_padj"], s=10, alpha=0.4, color="grey")
     ax.scatter(plot_df.loc[sig, "log2FoldChange"], plot_df.loc[sig, "neg_log10_padj"], s=14, alpha=0.7, color="crimson")
     ax.axhline(-math.log10(0.05), linestyle="--", color="black", linewidth=1)
@@ -844,7 +1023,19 @@ def write_volcano(deseq_df: pd.DataFrame, out_dir: Path, resume: bool):
     ax.axvline(1.0, linestyle="--", color="black", linewidth=1)
     ax.set_xlabel("log2 fold change")
     ax.set_ylabel("-log10 adjusted p-value")
-    ax.set_title("Volcano plot")
+    ax.set_title("Volcano plot (labels: top 20 genes by smallest adjusted p-value)")
+    label_df = plot_df.sort_values("padj", ascending=True).head(20)
+    for _, row in label_df.iterrows():
+        gid = str(row["gene_id"])[:40]
+        ax.annotate(
+            gid,
+            (row["log2FoldChange"], row["neg_log10_padj"]),
+            fontsize=5.5,
+            alpha=0.92,
+            ha="left",
+            va="bottom",
+            bbox=dict(boxstyle="round,pad=0.12", facecolor="white", edgecolor="0.7", linewidth=0.3, alpha=0.85),
+        )
     fig.tight_layout()
     fig.savefig(volcano_png, dpi=180)
     plt.close(fig)
@@ -857,7 +1048,12 @@ def write_gsea_nes_dotplot(
     resume: bool,
     max_terms: int,
 ):
-    """Scatter of NES vs GO terms; marker area scales with significance (-log10 p)."""
+    """Five lowest- and five highest-NES terms; marker area scales with significance (-log10 p)."""
+    if max_terms:
+        print(
+            "Note: --gsea-dotplot-max-terms is ignored; the NES dot plot shows "
+            "5 lowest + 5 highest NES terms."
+        )
     if should_skip(out_path, resume, "GSEA NES dot plot"):
         return
     if not report_path.exists():
@@ -884,18 +1080,24 @@ def write_gsea_nes_dotplot(
         print("Skipping GSEA dot plot: no valid NES values.")
         return
 
-    df_plot["_abs"] = df_plot["nes"].abs()
-    df_plot = df_plot.sort_values("_abs", ascending=False)
-    if max_terms > 0 and len(df_plot) > max_terms:
-        df_plot = df_plot.head(max_terms)
-        print(f"GSEA dot plot: showing top {max_terms} terms by |NES|.")
-    elif len(df_plot) > 400:
-        print(
-            f"GSEA dot plot: {len(df_plot)} terms; consider --gsea-dotplot-max-terms "
-            "for a smaller figure."
-        )
-
+    df_plot = df_plot.drop_duplicates(subset=["term"], keep="first")
+    neg_pool = df_plot[df_plot["nes"] < 0]
+    pos_pool = df_plot[df_plot["nes"] > 0]
+    neg5 = neg_pool.nsmallest(min(5, len(neg_pool)), "nes") if len(neg_pool) else pd.DataFrame()
+    pos5 = pos_pool.nlargest(min(5, len(pos_pool)), "nes") if len(pos_pool) else pd.DataFrame()
+    df_plot = pd.concat([neg5, pos5], ignore_index=True)
+    if df_plot.empty:
+        print("Skipping GSEA dot plot: no terms after selecting top/bottom NES.")
+        return
     df_plot = df_plot.sort_values("nes", ascending=True).reset_index(drop=True)
+
+    go_ids_for_lookup = df_plot["term"].astype(str).tolist()
+    name_by_id = _fetch_go_term_names(go_ids_for_lookup)
+    if any(str(t).startswith("GO:") for t in go_ids_for_lookup) and not name_by_id:
+        print(
+            "GSEA dot plot: could not fetch GO term names from QuickGO (offline or API error); "
+            "using term IDs only."
+        )
 
     p_col = next(
         (c for c in ("NOM p-val", "FDR q-val", "FWER p-val") if c in df.columns),
@@ -927,21 +1129,41 @@ def write_gsea_nes_dotplot(
             sm = np.where(valid, smin + (sm - lo) / (hi - lo) * (smax - smin), (smin + smax) / 2)
 
     y = np.arange(len(df_plot))
-    fig_h = min(max(5.0, 0.22 * len(df_plot) + 1.5), 120.0)
-    fig, ax = plt.subplots(figsize=(9, fig_h))
+    n_t = len(df_plot)
+    fig_w = 10.0
+    fig_h = min(max(5.5, 0.19 * n_t + 2.0), 120.0)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     colors = np.where(df_plot["nes"].to_numpy() >= 0, "#c0392b", "#2980b9")
-    ax.scatter(df_plot["nes"], y, s=sm, c=colors, alpha=0.85, edgecolors="white", linewidths=0.4)
-    ax.axvline(0.0, color="0.45", linewidth=0.9, linestyle="--")
+    ax.grid(True, axis="x", linestyle=":", alpha=0.45, zorder=0)
+    ax.set_axisbelow(True)
+    ax.scatter(
+        df_plot["nes"],
+        y,
+        s=sm,
+        c=colors,
+        alpha=0.88,
+        edgecolors="white",
+        linewidths=0.55,
+        zorder=2,
+    )
+    ax.axvline(0.0, color="0.35", linewidth=1.0, linestyle="--", zorder=1)
     ax.set_yticks(y)
-    labels = df_plot["term"].tolist()
-    if len(labels) and all(s.startswith("GO:") for s in labels[: min(5, len(labels))]):
-        labels = [s.replace("GO:", "") for s in labels]
-    ax.set_yticklabels(labels, fontsize=max(5, 9 - len(df_plot) // 80))
-    ax.set_xlabel("NES (normalized enrichment score)")
-    ax.set_ylabel("Gene set (GO term)")
-    ax.set_title(f"GSEA prerank ({len(df_plot)} terms; marker size ∝ {size_label})")
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    raw_terms = df_plot["term"].astype(str).tolist()
+    labels = [_truncate_label(_format_go_axis_label(t, name_by_id)) for t in raw_terms]
+    ytick_fs = max(7.0, min(9.5, 12.0 - n_t / 12.0))
+    ax.set_yticklabels(labels, fontsize=ytick_fs)
+    ax.set_xlabel("NES (normalized enrichment score)", fontsize=11)
+    ax.set_ylabel("Gene set (GO term)", fontsize=11)
+    ax.tick_params(axis="x", labelsize=10)
+    ax.set_title(
+        f"GSEA prerank (5 lowest + 5 highest NES; marker size ∝ {size_label})",
+        fontsize=12,
+        pad=10,
+    )
+    max_lab = max((len(str(l)) for l in labels), default=12)
+    left_m = min(0.46, 0.11 + min(max_lab, 42) * 0.0085)
+    fig.subplots_adjust(left=left_m, right=0.98, top=0.96, bottom=0.05)
+    fig.savefig(out_path, dpi=200, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     print(f"GSEA NES dot plot written: {out_path}")
 
@@ -1153,7 +1375,7 @@ def build_parser():
         "--gsea-dotplot-max-terms",
         type=int,
         default=0,
-        help="Max GO terms on the combined NES dot plot (0 = plot all terms in the report).",
+        help="Ignored: NES dot plot is fixed at five lowest + five highest NES (kept for CLI compatibility).",
     )
     run_p.add_argument(
         "--de-heatmap-top-per",
