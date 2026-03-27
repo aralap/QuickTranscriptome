@@ -5,6 +5,7 @@ import math
 import shutil
 import subprocess
 import sys
+from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 from urllib.error import HTTPError, URLError
@@ -24,6 +25,10 @@ SPECIES_DEFAULTS = {
             "https://ftp.ensemblgenomes.ebi.ac.uk/pub/fungi/release-60/gff3/candida_parapsilosis/Candida_parapsilosis.GCA000182765v2.60.gff3.gz",
             "https://ftp.ensemblgenomes.ebi.ac.uk/pub/fungi/release-60/gff3/candida_parapsilosis/Candida_parapsilosis.C_parapsilosis_CDC317.60.gff3.gz",
             "http://www.candidagenome.org/download/gff/C_parapsilosis_CDC317/C_parapsilosis_CDC317_current_features.gff",
+        ],
+        "gsea_gaf_urls": [
+            "http://www.candidagenome.org/download/go/cgd_C_parapsilosis_CDC317.gaf.gz",
+            "http://www.candidagenome.org/download/go/gene_association.cgd.gz",
         ],
     }
 }
@@ -200,6 +205,65 @@ def build_reference(species, refs_dir: Path, fasta_url=None, gff_url=None):
     return fasta, gff, index
 
 
+def _build_gmt_from_gaf(gaf_path: Path, gmt_path: Path) -> Path:
+    """Convert a GAF file into a simple GO-term GMT file."""
+    go_to_genes = defaultdict(set)
+    open_func = gzip.open if gaf_path.suffix == ".gz" else open
+    with open_func(gaf_path, "rt", encoding="utf-8", errors="ignore") as handle:
+        for line in handle:
+            if not line.strip() or line.startswith("!"):
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 7:
+                continue
+            qualifier = parts[3]
+            if "NOT" in qualifier.split("|"):
+                continue
+            go_id = parts[4].strip()
+            if not go_id:
+                continue
+            # Prefer stable object ID for better matching to gene_id-style counts.
+            gene_id = parts[1].strip() or parts[2].strip()
+            if not gene_id:
+                continue
+            go_to_genes[go_id].add(gene_id)
+
+    with open(gmt_path, "w", encoding="utf-8") as out:
+        for go_id in sorted(go_to_genes):
+            genes = sorted(go_to_genes[go_id])
+            if not genes:
+                continue
+            out.write(f"{go_id}\tCGD_GO\t" + "\t".join(genes) + "\n")
+    return gmt_path
+
+
+def resolve_gsea_gmt(
+    species: str,
+    refs_dir: Path,
+    user_gsea_gmt: Optional[str],
+    user_gsea_gaf_url: Optional[str],
+    resume: bool,
+) -> Optional[str]:
+    if user_gsea_gmt:
+        return user_gsea_gmt
+
+    species_defaults = SPECIES_DEFAULTS.get(species, {})
+    gaf_urls = normalize_urls(user_gsea_gaf_url) or normalize_urls(species_defaults.get("gsea_gaf_urls"))
+    if not gaf_urls:
+        return None
+
+    gsea_ref_dir = refs_dir / "gsea"
+    ensure_dir(gsea_ref_dir)
+    gmt_out = gsea_ref_dir / f"{species}_go_from_gaf.gmt"
+    if should_skip(gmt_out, resume, "auto-generated GSEA GMT"):
+        return str(gmt_out)
+
+    gaf_path = download_first_available(gaf_urls, gsea_ref_dir)
+    _build_gmt_from_gaf(gaf_path, gmt_out)
+    print(f"Auto-generated GSEA GMT from GAF: {gmt_out}")
+    return str(gmt_out)
+
+
 def align_and_count(args):
     out_dir = Path(args.out_dir)
     refs_dir = out_dir / "refs"
@@ -298,6 +362,13 @@ def align_and_count(args):
         print(f"Counts matrix written: {clean_out}")
 
     counts_for_plots = clean.set_index("gene_id").T.astype(int)
+    gsea_gmt = resolve_gsea_gmt(
+        species=args.species,
+        refs_dir=refs_dir,
+        user_gsea_gmt=args.gsea_gmt,
+        user_gsea_gaf_url=args.gsea_gaf_url,
+        resume=args.resume,
+    )
     if args.metadata and args.condition_column:
         run_deseq(
             clean_out,
@@ -305,7 +376,7 @@ def align_and_count(args):
             args.condition_column,
             counts_dir,
             args.resume,
-            args.gsea_gmt,
+            gsea_gmt,
             args.gsea_min_size,
             args.gsea_max_size,
         )
@@ -676,7 +747,12 @@ def build_parser():
     run_p.add_argument(
         "--gsea-gmt",
         default=None,
-        help="Optional path to GMT gene-set file for preranked GSEA.",
+        help="Optional path to GMT gene-set file for preranked GSEA. If omitted, an organism GAF may be auto-downloaded and converted to GMT when available.",
+    )
+    run_p.add_argument(
+        "--gsea-gaf-url",
+        default=None,
+        help="Optional URL to a GAF file to auto-build GMT for GSEA (used when --gsea-gmt is not provided).",
     )
     run_p.add_argument("--gsea-min-size", type=int, default=10, help="Minimum gene-set size for GSEA.")
     run_p.add_argument("--gsea-max-size", type=int, default=500, help="Maximum gene-set size for GSEA.")
