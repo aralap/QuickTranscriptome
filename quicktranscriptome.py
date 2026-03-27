@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 import argparse
+import base64
 import gzip
+import html
 import math
 import shutil
 import subprocess
 import sys
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.error import HTTPError, URLError
@@ -276,6 +279,133 @@ def resolve_gsea_gmt(
     return str(gmt_out)
 
 
+def _summary_plot_candidates(counts_dir: Path) -> list[tuple[str, Path]]:
+    return [
+        ("PCA", counts_dir / "pca_plot.png"),
+        ("Top variable genes", counts_dir / "heatmap_top_variable_genes.png"),
+        ("Volcano (DESeq2)", counts_dir / "volcano_plot.png"),
+        ("Top DE genes", counts_dir / "heatmap_top_de_genes.png"),
+        ("GSEA prerank (NES)", counts_dir / "gsea" / "gsea_prerank_nes_dotplot.png"),
+    ]
+
+
+def write_run_summary(out_dir: Path, counts_dir: Path, args: argparse.Namespace, resume: bool):
+    """Write one-page HTML and PDF with embedded figures and run metadata."""
+    html_path = out_dir / "run_summary.html"
+    pdf_path = out_dir / "run_summary.pdf"
+    if resume and html_path.exists() and pdf_path.exists():
+        print(f"Resume enabled: using existing run summary: {html_path}, {pdf_path}")
+        return
+
+    plot_items = [(t, p) for t, p in _summary_plot_candidates(counts_dir) if p.is_file()]
+
+    def _img_data_uri(path: Path) -> str:
+        raw = path.read_bytes()
+        b64 = base64.standard_b64encode(raw).decode("ascii")
+        return f"data:image/png;base64,{b64}"
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = [
+        "<!DOCTYPE html>",
+        '<html lang="en">',
+        "<head>",
+        '<meta charset="utf-8">',
+        "<title>QuickTranscriptome run summary</title>",
+        "<style>",
+        "body { font-family: system-ui, Segoe UI, sans-serif; margin: 12px; font-size: 13px; color: #222; }",
+        "h1 { font-size: 1.15rem; margin: 0 0 8px 0; }",
+        ".meta { background: #f6f6f6; padding: 10px 12px; border-radius: 6px; margin-bottom: 12px; line-height: 1.45; }",
+        ".meta code { font-size: 12px; word-break: break-all; }",
+        ".grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; align-items: start; }",
+        ".fig { border: 1px solid #ddd; border-radius: 4px; padding: 6px; background: #fff; }",
+        ".fig h2 { font-size: 11px; margin: 0 0 6px 0; font-weight: 600; }",
+        ".fig img { width: 100%; height: auto; max-height: 320px; object-fit: contain; display: block; }",
+        "@media print { body { margin: 0; } .meta { break-inside: avoid; } .fig { break-inside: avoid; } }",
+        "</style>",
+        "</head>",
+        "<body>",
+        "<h1>QuickTranscriptome — run summary</h1>",
+        '<div class="meta">',
+        f"<div><strong>Generated</strong>: {html.escape(now)}</div>",
+        f"<div><strong>Species</strong>: {html.escape(str(args.species))}</div>",
+        f"<div><strong>Reads</strong>: <code>{html.escape(str(Path(args.reads_dir).resolve()))}</code></div>",
+        f"<div><strong>Output</strong>: <code>{html.escape(str(out_dir.resolve()))}</code></div>",
+        f"<div><strong>Threads</strong>: {args.threads}</div>",
+    ]
+    if args.metadata:
+        lines.append(
+            f"<div><strong>Metadata</strong>: <code>{html.escape(str(Path(args.metadata).resolve()))}</code></div>"
+        )
+        lines.append(
+            f"<div><strong>Condition column</strong>: {html.escape(str(args.condition_column))}</div>"
+        )
+    else:
+        lines.append("<div><strong>Differential expression</strong>: not run (no metadata)</div>")
+    lines.append(f"<div><strong>GSEA GMT</strong>: {html.escape(str(args.gsea_gmt or '(auto if species default)'))}</div>")
+    lines.append("</div>")
+
+    if not plot_items:
+        lines.append("<p>No plot PNGs were found yet under <code>counts/</code> (run may be incomplete).</p>")
+    else:
+        lines.append('<div class="grid">')
+        for title, path in plot_items:
+            lines.append('<div class="fig">')
+            lines.append(f"<h2>{html.escape(title)}</h2>")
+            lines.append(f'<img src="{_img_data_uri(path)}" alt="{html.escape(title)}">')
+            lines.append("</div>")
+        lines.append("</div>")
+
+    lines.extend(["</body>", "</html>"])
+    html_path.write_text("\n".join(lines), encoding="utf-8")
+    print(f"Run summary HTML written: {html_path}")
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.image as mpimg
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except ImportError as exc:
+        print(f"Skipping run summary PDF (matplotlib unavailable): {exc}")
+        return
+
+    n = len(plot_items)
+    if n == 0:
+        fig, ax = plt.subplots(figsize=(8.5, 11))
+        ax.text(
+            0.5,
+            0.5,
+            "No plot PNGs were found for this run.",
+            ha="center",
+            va="center",
+            fontsize=12,
+        )
+        ax.axis("off")
+        fig.savefig(pdf_path, format="pdf", bbox_inches="tight")
+        plt.close(fig)
+        print(f"Run summary PDF written: {pdf_path}")
+        return
+
+    cols = 2
+    rows = (n + cols - 1) // cols
+    fig_h = min(11.0, max(5.0, 2.15 * rows + 0.8))
+    fig, axes = plt.subplots(rows, cols, figsize=(8.5, fig_h))
+    axes_arr = np.atleast_1d(axes).ravel()
+    for i, (title, path) in enumerate(plot_items):
+        ax = axes_arr[i]
+        img = mpimg.imread(str(path))
+        ax.imshow(img)
+        ax.set_title(title, fontsize=8)
+        ax.axis("off")
+    for j in range(i + 1, len(axes_arr)):
+        axes_arr[j].axis("off")
+    fig.tight_layout()
+    fig.savefig(pdf_path, format="pdf", bbox_inches="tight")
+    plt.close(fig)
+    print(f"Run summary PDF written: {pdf_path}")
+
+
 def align_and_count(args):
     out_dir = Path(args.out_dir)
     refs_dir = out_dir / "refs"
@@ -398,6 +528,8 @@ def align_and_count(args):
     else:
         write_pca(counts_for_plots, None, None, counts_dir, args.resume)
         write_heatmap(counts_for_plots, counts_dir, args.resume)
+
+    write_run_summary(out_dir, counts_dir, args, args.resume)
 
 
 def _sample_ordered_counts_and_metadata(counts_matrix: Path, metadata_path: Path, condition_col: str):
