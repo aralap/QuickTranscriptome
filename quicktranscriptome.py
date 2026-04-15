@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -23,6 +24,75 @@ def normalize_gene_identifier(raw: str) -> str:
     s = str(raw).strip()
     if s.lower().startswith("gene:"):
         return s[5:].lstrip()
+    return s
+
+
+@dataclass
+class SampleLabelRules:
+    """Optional display names for plots: exact keys (after canonical_sample_id) and ordered substring rules."""
+
+    exact: dict[str, str] = field(default_factory=dict)
+    substring: list[tuple[str, str]] = field(default_factory=list)
+
+
+def load_sample_label_rules(path: Path) -> SampleLabelRules:
+    """
+    Load TSV/CSV with two main columns mapping pipeline sample ids to plot labels.
+
+    - First column (header may be sample, id, from, key, ...): internal / FASTQ-derived id, or
+      ``contains:SUBSTRING`` to match any sample id containing SUBSTRING (first match wins).
+    - Second column (label, display, to, ...): text shown on PCA / heatmaps.
+
+    Example::
+
+        sample	label
+        PBSQ7G_1_194_1	615/P/19
+        contains:_195_	974/P/16
+    """
+    df = pd.read_csv(path, sep=None, engine="python", comment="#")
+    if df.shape[1] < 2:
+        raise ValueError(f"Sample label map needs at least 2 columns: {path}")
+    raw_cols = [str(c).strip() for c in df.columns]
+    cols_l = [c.lower() for c in raw_cols]
+
+    def _pick(names: list[str], idx: int) -> str:
+        for n in names:
+            if n in cols_l:
+                return raw_cols[cols_l.index(n)]
+        return raw_cols[idx]
+
+    key_col = _pick(["sample", "id", "from", "key", "run_id", "name"], 0)
+    val_col = _pick(["label", "display", "to", "pretty"], 1)
+    if key_col == val_col and len(raw_cols) >= 2:
+        key_col, val_col = raw_cols[0], raw_cols[1]
+
+    rules = SampleLabelRules()
+    for _, row in df.iterrows():
+        k = str(row[key_col]).strip()
+        v = str(row[val_col]).strip()
+        if not k or k.startswith("#") or (pd.notna(row[key_col]) and str(row[key_col]).lower() == "nan"):
+            continue
+        kl = k.lower()
+        if kl.startswith("contains:"):
+            needle = k.split(":", 1)[1].strip()
+            if needle:
+                rules.substring.append((needle, v))
+        else:
+            rules.exact[canonical_sample_id(k)] = v
+    return rules
+
+
+def display_for_sample(sample_id: str, rules: Optional[SampleLabelRules]) -> str:
+    """Plot-facing label; keeps internal sample_id for joins when rules is None."""
+    if rules is None:
+        return str(sample_id)
+    s = str(sample_id)
+    c = canonical_sample_id(s)
+    if c in rules.exact:
+        return rules.exact[c]
+    for needle, lab in rules.substring:
+        if needle in s or needle in c:
+            return lab
     return s
 
 
@@ -459,6 +529,10 @@ def write_run_summary(out_dir: Path, counts_dir: Path, args: argparse.Namespace,
     lines.append(
         f"<p><strong>GSEA gene sets (GMT)</strong>: {html.escape(str(args.gsea_gmt or 'auto from species defaults if available'))}</p>"
     )
+    if getattr(args, "sample_label_map", None):
+        lines.append(
+            f"<p><strong>Sample display map</strong>: <code>{html.escape(str(Path(args.sample_label_map).resolve()))}</code></p>"
+        )
     lines.append("</section>")
 
     lines.append('<section class="section">')
@@ -690,6 +764,10 @@ def align_and_count(args):
         user_gsea_gaf_url=args.gsea_gaf_url,
         resume=args.resume,
     )
+    sample_label_rules: Optional[SampleLabelRules] = None
+    if getattr(args, "sample_label_map", None):
+        sample_label_rules = load_sample_label_rules(Path(args.sample_label_map))
+
     if args.metadata and args.condition_column:
         run_deseq(
             clean_out,
@@ -703,10 +781,11 @@ def align_and_count(args):
             args.gsea_dotplot_max_terms,
             args.de_heatmap_top_per,
             args.de_heatmap_padj,
+            sample_label_rules,
         )
     else:
-        write_pca(counts_for_plots, None, None, counts_dir, args.resume)
-        write_heatmap(counts_for_plots, counts_dir, args.resume)
+        write_pca(counts_for_plots, None, None, counts_dir, args.resume, sample_label_rules)
+        write_heatmap(counts_for_plots, counts_dir, args.resume, sample_label_rules=sample_label_rules)
 
     write_run_summary(out_dir, counts_dir, args, args.resume)
 
@@ -788,6 +867,7 @@ def write_pca(
     condition_col: Optional[str],
     out_dir: Path,
     resume: bool,
+    sample_label_rules: Optional[SampleLabelRules] = None,
 ):
     import matplotlib.pyplot as plt
     import numpy as np
@@ -805,6 +885,7 @@ def write_pca(
     var_exp = (s ** 2) / max((x.shape[0] - 1), 1)
     var_exp_ratio = var_exp / max(var_exp.sum(), 1e-12)
     use_groups = bool(meta_df is not None and condition_col and condition_col in meta_df.columns)
+    disp = [display_for_sample(s, sample_label_rules) for s in counts_df.index]
     pca_df = pd.DataFrame(
         {
             "sample": counts_df.index,
@@ -815,6 +896,10 @@ def write_pca(
             ),
         }
     )
+    if sample_label_rules is not None and any(
+        display_for_sample(s, sample_label_rules) != str(s) for s in counts_df.index
+    ):
+        pca_df["display_label"] = disp
     pca_df.to_csv(pca_tsv, sep="\t", index=False)
 
     group_col = condition_col if use_groups else "group"
@@ -822,7 +907,12 @@ def write_pca(
     for cond, group in pca_df.groupby(group_col):
         ax.scatter(group["PC1"], group["PC2"], label=str(cond), s=70, alpha=0.85)
         for _, row in group.iterrows():
-            ax.annotate(row["sample"], (row["PC1"], row["PC2"]), fontsize=8, alpha=0.85)
+            ax.annotate(
+                display_for_sample(row["sample"], sample_label_rules),
+                (row["PC1"], row["PC2"]),
+                fontsize=8,
+                alpha=0.85,
+            )
     ax.set_xlabel(f"PC1 ({var_exp_ratio[0] * 100:.1f}% var)" if len(var_exp_ratio) > 0 else "PC1")
     ax.set_ylabel(f"PC2 ({var_exp_ratio[1] * 100:.1f}% var)" if len(var_exp_ratio) > 1 else "PC2")
     ax.set_title("PCA of samples (log2 counts + 1)")
@@ -841,6 +931,7 @@ def write_heatmap(
     top_n: int = 50,
     meta_df: Optional[pd.DataFrame] = None,
     condition_col: Optional[str] = None,
+    sample_label_rules: Optional[SampleLabelRules] = None,
 ):
     import matplotlib.pyplot as plt
     import numpy as np
@@ -875,10 +966,17 @@ def write_heatmap(
     ax.set_ylabel("Genes")
     ax.set_xticks(range(len(z.index)))
     if meta_df is not None and condition_col and condition_col in meta_df.columns:
-        sample_labels = [f"{s} ({meta_df.loc[s, condition_col]})" for s in z.index]
+        sample_labels = [
+            f"{display_for_sample(s, sample_label_rules)} ({meta_df.loc[s, condition_col]})"
+            for s in z.index
+        ]
         ax.set_xticklabels(sample_labels, rotation=90, fontsize=7)
     else:
-        ax.set_xticklabels(z.index, rotation=90, fontsize=7)
+        ax.set_xticklabels(
+            [display_for_sample(s, sample_label_rules) for s in z.index],
+            rotation=90,
+            fontsize=7,
+        )
     fig.colorbar(im, ax=ax, label="z-score")
     fig.tight_layout()
     fig.savefig(heatmap_png, dpi=180)
@@ -897,6 +995,7 @@ def write_de_top_heatmap(
     padj_cutoff: float,
     numerator_level: str,
     denominator_level: str,
+    sample_label_rules: Optional[SampleLabelRules] = None,
 ):
     """Heatmap of log2 counts (z-scored per gene) for top genes up/down in the DESeq2 contrast."""
     import matplotlib.pyplot as plt
@@ -1019,10 +1118,17 @@ def write_de_top_heatmap(
     ax.set_ylabel("Genes (downregulated, then upregulated)")
     ax.set_xticks(range(len(z.index)))
     if meta_df is not None and condition_col and condition_col in meta_df.columns:
-        sample_labels = [f"{s} ({meta_df.loc[s, condition_col]})" for s in z.index]
+        sample_labels = [
+            f"{display_for_sample(s, sample_label_rules)} ({meta_df.loc[s, condition_col]})"
+            for s in z.index
+        ]
         ax.set_xticklabels(sample_labels, rotation=90, fontsize=7)
     else:
-        ax.set_xticklabels(z.index, rotation=90, fontsize=7)
+        ax.set_xticklabels(
+            [display_for_sample(s, sample_label_rules) for s in z.index],
+            rotation=90,
+            fontsize=7,
+        )
     ax.set_yticks(range(len(gene_ids)))
     ax.set_yticklabels(gene_ids, fontsize=max(5, 8 - len(gene_ids) // 40))
     fig.colorbar(im, ax=ax, label="z-score (per gene)")
@@ -1032,9 +1138,22 @@ def write_de_top_heatmap(
     print(f"DE top genes heatmap written: {heatmap_png}")
 
 
+def _volcano_gene_label(row: pd.Series, columns: pd.Index) -> str:
+    for col in ("gene_name", "symbol", "gene_symbol", "Gene.symbol", "Gene"):
+        if col in columns:
+            v = row.get(col)
+            if pd.notna(v) and str(v).strip() and str(v).strip().lower() != "nan":
+                return str(v).strip()[:40]
+    gid = row.get("gene_id")
+    if gid is not None and pd.notna(gid) and str(gid).strip():
+        return str(gid).strip()[:40]
+    return "?"
+
+
 def write_volcano(deseq_df: pd.DataFrame, out_dir: Path, resume: bool):
     import matplotlib.pyplot as plt
     import numpy as np
+    from matplotlib.lines import Line2D
 
     volcano_png = out_dir / "volcano_plot.png"
     if should_skip(volcano_png, resume, "volcano plot"):
@@ -1061,14 +1180,40 @@ def write_volcano(deseq_df: pd.DataFrame, out_dir: Path, resume: bool):
     ax.axvline(1.0, linestyle="--", color="black", linewidth=1)
     ax.set_xlabel("log2 fold change")
     ax.set_ylabel("-log10 adjusted p-value")
-    ax.set_title("Volcano plot (labels: top 20 genes by smallest adjusted p-value)")
+    ax.set_title("Volcano plot (point labels: top 20 genes by smallest adjusted p-value)")
+    legend_handles = [
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            color="none",
+            markerfacecolor="0.55",
+            markeredgecolor="0.45",
+            markersize=6,
+            alpha=0.65,
+            label="Not significant",
+        ),
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            color="none",
+            markerfacecolor="crimson",
+            markeredgecolor="darkred",
+            markersize=7,
+            alpha=0.85,
+            label="padj < 0.05 and |log2FC| ≥ 1",
+        ),
+    ]
+    ax.legend(handles=legend_handles, loc="best", framealpha=0.92, fontsize=8)
     label_df = plot_df.sort_values("padj", ascending=True).head(20)
+    cols = plot_df.columns
     for _, row in label_df.iterrows():
-        gid = str(row["gene_id"])[:40]
+        gid = _volcano_gene_label(row, cols)
         ax.annotate(
             gid,
             (row["log2FoldChange"], row["neg_log10_padj"]),
-            fontsize=5.5,
+            fontsize=6,
             alpha=0.92,
             ha="left",
             va="bottom",
@@ -1273,6 +1418,7 @@ def run_deseq(
     gsea_dotplot_max_terms: int,
     de_heatmap_top_per: int,
     de_heatmap_padj: float,
+    sample_label_rules: Optional[SampleLabelRules] = None,
 ):
     from pydeseq2.dds import DeseqDataSet
     from pydeseq2.ds import DeseqStats
@@ -1331,8 +1477,15 @@ def run_deseq(
         print(f"Skipping DE/volcano because DESeq2 failed: {exc}")
         return
 
-    write_pca(counts_df, meta_df, condition_col, out_dir, resume)
-    write_heatmap(counts_df, out_dir, resume, meta_df=meta_df, condition_col=condition_col)
+    write_pca(counts_df, meta_df, condition_col, out_dir, resume, sample_label_rules)
+    write_heatmap(
+        counts_df,
+        out_dir,
+        resume,
+        meta_df=meta_df,
+        condition_col=condition_col,
+        sample_label_rules=sample_label_rules,
+    )
     try:
         write_volcano(res, out_dir, resume)
     except Exception as exc:
@@ -1352,6 +1505,7 @@ def run_deseq(
             de_heatmap_padj,
             num_l,
             den_l,
+            sample_label_rules,
         )
     except Exception as exc:
         print(f"Skipping DE top genes heatmap: {exc}")
@@ -1368,6 +1522,86 @@ def run_deseq(
             )
         except Exception as exc:
             print(f"Skipping GSEA: {exc}")
+
+
+def replot_from_outputs(args):
+    """Regenerate plot PNGs and run summary from an existing count matrix (no alignment or counting)."""
+    out_dir = Path(args.out_dir)
+    counts_dir = out_dir / "counts"
+    matrix = counts_dir / "counts_matrix.tsv"
+    if not matrix.is_file():
+        raise FileNotFoundError(f"Missing {matrix}; run the full pipeline first.")
+
+    sample_label_rules: Optional[SampleLabelRules] = None
+    if getattr(args, "sample_label_map", None):
+        sample_label_rules = load_sample_label_rules(Path(args.sample_label_map))
+
+    if args.metadata and args.condition_column:
+        counts_df, meta_df, condition_col = _sample_ordered_counts_and_metadata(
+            matrix, Path(args.metadata), args.condition_column
+        )
+        counts_df = counts_df.copy()
+        meta_df = meta_df.copy()
+        counts_df.index = pd.Index(counts_df.index.astype(str), name="sample")
+        meta_df.index = pd.Index(meta_df.index.astype(str), name="sample")
+        counts_df.columns = counts_df.columns.astype(str)
+        counts_df = counts_df.loc[meta_df.index]
+        meta_df = meta_df.loc[counts_df.index]
+        res_path = counts_dir / "deseq2_results.tsv"
+        if not res_path.is_file():
+            raise FileNotFoundError(
+                f"Missing {res_path}; run the full pipeline with --metadata to produce DESeq2 results first."
+            )
+        res = pd.read_csv(res_path, sep="\t")
+        write_pca(counts_df, meta_df, condition_col, counts_dir, args.resume, sample_label_rules)
+        write_heatmap(
+            counts_df,
+            counts_dir,
+            args.resume,
+            meta_df=meta_df,
+            condition_col=condition_col,
+            sample_label_rules=sample_label_rules,
+        )
+        write_volcano(res, counts_dir, args.resume)
+        levels_plot = [
+            str(v)
+            for v in pd.Series(meta_df[condition_col]).dropna().astype(str).unique().tolist()
+        ]
+        num_l = levels_plot[1] if len(levels_plot) >= 2 else "?"
+        den_l = levels_plot[0] if len(levels_plot) >= 2 else "?"
+        try:
+            write_de_top_heatmap(
+                counts_df,
+                meta_df,
+                condition_col,
+                res,
+                counts_dir,
+                args.resume,
+                args.de_heatmap_top_per,
+                args.de_heatmap_padj,
+                num_l,
+                den_l,
+                sample_label_rules,
+            )
+        except Exception as exc:
+            print(f"Skipping DE top genes heatmap: {exc}")
+        gsea_rep = counts_dir / "gsea" / "gseapy.gene_set.prerank.report.csv"
+        gsea_png = counts_dir / "gsea" / "gsea_prerank_nes_dotplot.png"
+        if gsea_rep.is_file():
+            try:
+                write_gsea_nes_dotplot(gsea_rep, gsea_png, args.resume, args.gsea_dotplot_max_terms)
+            except Exception as exc:
+                print(f"Skipping GSEA dot plot: {exc}")
+    else:
+        clean = pd.read_csv(matrix, sep="\t")
+        counts_for_plots = clean.set_index("gene_id").T.astype(int)
+        counts_for_plots.index = pd.Index(
+            [canonical_sample_id(s) for s in counts_for_plots.index], name="sample"
+        )
+        write_pca(counts_for_plots, None, None, counts_dir, args.resume, sample_label_rules)
+        write_heatmap(counts_for_plots, counts_dir, args.resume, sample_label_rules=sample_label_rules)
+
+    write_run_summary(out_dir, counts_dir, args, args.resume)
 
 
 def build_parser():
@@ -1427,7 +1661,44 @@ def build_parser():
         default=0.05,
         help="Adjusted p-value cutoff when choosing top DE genes for the DE heatmap.",
     )
+    run_p.add_argument(
+        "--sample-label-map",
+        default=None,
+        help="Optional TSV/CSV mapping sample ids to plot labels; use contains:SUBSTRING in id column for substring match.",
+    )
     run_p.set_defaults(func=align_and_count)
+
+    replot_p = sub.add_parser(
+        "replot",
+        help="Redraw PCA/heatmaps/volcano/GSEA dot plot and summary from existing counts (no alignment).",
+    )
+    replot_p.add_argument("--out-dir", default="results", help="Same as run --out-dir")
+    replot_p.add_argument(
+        "--reads-dir",
+        default=".",
+        help="Used only in the HTML/PDF summary text.",
+    )
+    replot_p.add_argument("--species", default="parapsilosis", help="Used only in the summary.")
+    replot_p.add_argument("--threads", type=int, default=4, help="Used only in the summary.")
+    replot_p.add_argument("--metadata", default=None, help="Metadata TSV/CSV (for DE plots)")
+    replot_p.add_argument("--condition-column", default=None, help="Condition column (with --metadata)")
+    replot_p.add_argument(
+        "--sample-label-map",
+        default=None,
+        help="TSV/CSV: column 1 = sample id or contains:SUBSTR, column 2 = display label.",
+    )
+    replot_p.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="If True, keep existing plot PNGs (default: False, overwrite plots).",
+    )
+    replot_p.add_argument("--gsea-gmt", default=None, help="Recorded in summary only.")
+    replot_p.add_argument("--gsea-dotplot-max-terms", type=int, default=0)
+    replot_p.add_argument("--de-heatmap-top-per", type=int, default=25)
+    replot_p.add_argument("--de-heatmap-padj", type=float, default=0.05)
+    replot_p.set_defaults(func=replot_from_outputs)
+
     return parser
 
 
