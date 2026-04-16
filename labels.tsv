@@ -1,0 +1,7 @@
+# Example sample display map for QuickTranscriptome.
+# Use: --sample-label-map labels.tsv  (run)  or  replot --sample-label-map labels.tsv
+# Replace sample ids with names that match your count matrix (FASTQ/BAM stems after canonical rules).
+# Rows starting with "contains:" match any sample id containing that substring (first match wins).
+sample	label
+PBSQ7G_1_194_1	615/P/19
+contains:_195_	974/P/16
