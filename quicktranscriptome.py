@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import base64
+import configparser
 import gzip
 import html
 import json
@@ -80,6 +81,94 @@ def load_sample_label_rules(path: Path) -> SampleLabelRules:
         else:
             rules.exact[canonical_sample_id(k)] = v
     return rules
+
+
+def _resolve_config_path(base: Path, val: str) -> str:
+    """Resolve relative paths in config files against the config file directory."""
+    s = val.strip()
+    if not s or "://" in s:
+        return s
+    p = Path(s).expanduser()
+    return str((base / p).resolve()) if not p.is_absolute() else str(p.resolve())
+
+
+def parse_quicktranscriptome_config(config_path: Path) -> tuple[dict, dict]:
+    """
+    Parse INI with [run] and [replot] sections. Keys use argparse dest names (reads_dir, out_dir, ...).
+    Relative paths are resolved against the config file's directory.
+    """
+    cp = configparser.ConfigParser(interpolation=None)
+    read_ok = cp.read(config_path, encoding="utf-8")
+    if not read_ok:
+        raise OSError(f"Could not read config: {config_path}")
+    base = config_path.resolve().parent
+
+    def _truthy(s: str) -> bool:
+        return str(s).strip().lower() in ("1", "true", "yes", "on")
+
+    def parse_section(section: str) -> dict:
+        if not cp.has_section(section):
+            return {}
+        out: dict = {}
+        for key, raw in cp.items(section):
+            if key == "DEFAULT":
+                continue
+            dest = key.strip().lower().replace("-", "_")
+            val = str(raw).strip()
+            if not val or val.startswith(";"):
+                continue
+            if dest in (
+                "reads_dir",
+                "out_dir",
+                "metadata",
+                "sample_label_map",
+                "gsea_gmt",
+                "fasta_url",
+                "gff_url",
+                "gsea_gaf_url",
+            ):
+                out[dest] = _resolve_config_path(base, val) if "://" not in val else val
+            elif dest in ("species", "condition_column"):
+                out[dest] = val
+            elif dest in ("threads", "gsea_min_size", "gsea_max_size", "gsea_dotplot_max_terms", "de_heatmap_top_per"):
+                out[dest] = int(val)
+            elif dest == "de_heatmap_padj":
+                out[dest] = float(val)
+            elif dest == "resume":
+                out[dest] = _truthy(val)
+            else:
+                continue
+        return out
+
+    return parse_section("run"), parse_section("replot")
+
+
+def _extract_config_from_argv(argv: list[str]) -> tuple[str, Optional[str], list[str]]:
+    """
+    argv is full argv after script name (e.g. ['run', '--config', 'x', ...]).
+    Returns command, config path or None, and argv list suitable for parse_args (still starts with command).
+    """
+    if not argv:
+        return "", None, argv
+    cmd = argv[0]
+    cfg_path: Optional[str] = None
+    rest: list[str] = [cmd]
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--config", "-c", "-config") and i + 1 < len(argv):
+            cfg_path = argv[i + 1]
+            i += 2
+        elif a.startswith("--config="):
+            cfg_path = a.split("=", 1)[1]
+            i += 1
+        elif a.startswith("-c="):
+            cfg_path = a.split("=", 1)[1]
+            i += 1
+        else:
+            rest.append(a)
+            i += 1
+    return cmd, cfg_path, rest
 
 
 def display_for_sample(sample_id: str, rules: Optional[SampleLabelRules]) -> str:
@@ -540,6 +629,10 @@ def write_run_summary(out_dir: Path, counts_dir: Path, args: argparse.Namespace,
         lines.append(
             f"<p><strong>Sample display map</strong>: <code>{html.escape(str(Path(args.sample_label_map).resolve()))}</code></p>"
         )
+    if getattr(args, "config_file_used", None):
+        lines.append(
+            f"<p><strong>Config file</strong>: <code>{html.escape(str(args.config_file_used))}</code></p>"
+        )
     lines.append("</section>")
 
     lines.append('<section class="section">')
@@ -667,6 +760,8 @@ def write_run_summary(out_dir: Path, counts_dir: Path, args: argparse.Namespace,
 
 
 def align_and_count(args):
+    if not getattr(args, "reads_dir", None):
+        raise ValueError("reads_dir is required: set [run] reads_dir in the config file or pass --reads-dir.")
     out_dir = Path(args.out_dir)
     refs_dir = out_dir / "refs"
     bam_dir = out_dir / "bam"
@@ -1611,12 +1706,27 @@ def replot_from_outputs(args):
     write_run_summary(out_dir, counts_dir, args, args.resume)
 
 
-def build_parser():
-    parser = argparse.ArgumentParser(description="QuickTranscriptome: minimal RNA-seq workflow")
+def build_parser(
+    run_defaults: Optional[dict] = None,
+    replot_defaults: Optional[dict] = None,
+):
+    parser = argparse.ArgumentParser(
+        description="QuickTranscriptome: minimal RNA-seq workflow",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Config file (INI): use 'run --config config.cfg' (or -c config.cfg) or the same for replot. "
+            "See config.cfg in the repository. [replot] inherits any missing keys from [run]. "
+            "Command-line options override the config file."
+        ),
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     run_p = sub.add_parser("run", help="Run alignment + feature counting (+ optional DE)")
-    run_p.add_argument("--reads-dir", required=True, help="Directory with *.fastq.gz files")
+    run_p.add_argument(
+        "--reads-dir",
+        default=None,
+        help="Directory with *.fastq.gz files (or set reads_dir in --config [run] section).",
+    )
     run_p.add_argument("--species", default="parapsilosis", help="Species key (default: parapsilosis)")
     run_p.add_argument("--fasta-url", default=None, help="Custom FASTA URL")
     run_p.add_argument("--gff-url", default=None, help="Custom GFF3 URL")
@@ -1674,6 +1784,8 @@ def build_parser():
         help="Optional TSV/CSV mapping sample ids to plot labels; use contains:SUBSTRING in id column for substring match.",
     )
     run_p.set_defaults(func=align_and_count)
+    if run_defaults:
+        run_p.set_defaults(**run_defaults)
 
     replot_p = sub.add_parser(
         "replot",
@@ -1705,13 +1817,41 @@ def build_parser():
     replot_p.add_argument("--de-heatmap-top-per", type=int, default=25)
     replot_p.add_argument("--de-heatmap-padj", type=float, default=0.05)
     replot_p.set_defaults(func=replot_from_outputs)
+    if replot_defaults:
+        replot_p.set_defaults(**replot_defaults)
 
     return parser
 
 
 def main():
-    parser = build_parser()
-    args = parser.parse_args()
+    argv = sys.argv[1:]
+    if not argv:
+        build_parser().print_help()
+        return
+    cmd, cfg_path_str, argv_rest = _extract_config_from_argv(argv)
+    if cmd not in ("run", "replot"):
+        print("ERROR: command must be 'run' or 'replot'.", file=sys.stderr)
+        build_parser().print_help()
+        sys.exit(2)
+
+    run_d: dict = {}
+    repl_d: dict = {}
+    if cfg_path_str:
+        cfg_p = Path(cfg_path_str).expanduser()
+        if not cfg_p.is_file():
+            print(f"ERROR: --config file not found: {cfg_p}", file=sys.stderr)
+            sys.exit(1)
+        run_d, repl_d = parse_quicktranscriptome_config(cfg_p.resolve())
+
+    if cmd == "run":
+        parser = build_parser(run_defaults=run_d or None)
+    else:
+        merged_replot = {**run_d, **repl_d}
+        parser = build_parser(replot_defaults=merged_replot or None)
+
+    args = parser.parse_args(argv_rest)
+    if cfg_path_str:
+        args.config_file_used = str(Path(cfg_path_str).expanduser().resolve())
     args.func(args)
 
 
