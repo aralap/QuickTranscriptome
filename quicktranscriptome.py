@@ -269,7 +269,14 @@ def canonical_sample_id(name: str) -> str:
 
 
 def discover_samples(reads_dir: Path):
-    reads = sorted(reads_dir.glob("*.fastq.gz")) + sorted(reads_dir.glob("*.fq.gz"))
+    if not reads_dir.exists() or not reads_dir.is_dir():
+        raise FileNotFoundError(f"Reads directory does not exist or is not a directory: {reads_dir}")
+
+    patterns = ("*.fastq.gz", "*.fq.gz", "*.fastq", "*.fq")
+    reads: list[Path] = []
+    for pattern in patterns:
+        reads.extend(reads_dir.rglob(pattern))
+    reads = sorted({p.resolve() for p in reads if p.is_file()})
     if not reads:
         raise FileNotFoundError(f"No FASTQ files found in {reads_dir}")
 
